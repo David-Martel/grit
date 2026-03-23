@@ -168,7 +168,7 @@ jobs:
             desc "Coordination layer for parallel AI agents on top of git"
             homepage "https://github.com/rtk-ai/grit"
             version "VERSION_PLACEHOLDER"
-            license "MIT"
+            license "LicenseRef-Source-Available"
 
             on_macos do
               on_intel do

@@ -156,4 +156,6 @@ TypeScript, JavaScript, Rust, Python (extensible via tree-sitter grammars)
 
 ## License
 
-MIT — Copyright (c) 2026 Patrick Szymkowiak
+Source-Available — Free for individuals and teams ≤20 people. Enterprise use requires a license. See [LICENSE](LICENSE) for details.
+
+Copyright (c) 2025-2026 RTK AI. All rights reserved.
