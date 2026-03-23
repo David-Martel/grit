@@ -158,7 +158,7 @@ impl SymbolIndex {
             "impl_item" => "impl",
             "enum_item" | "enum_declaration" => "enum",
             "interface_declaration" => "interface",
-            "trait_item" => "trait",
+            "trait_item" | "trait_declaration" => "trait",
             "type_alias_declaration" | "type_item" | "type_declaration" => "type",
             "arrow_function" => "arrow_fn",
             "export_statement" => "export",
@@ -288,6 +288,19 @@ impl SymbolIndex {
                     ("singleton_method", NameExtractor::Field("name")),
                     ("class", NameExtractor::Field("name")),
                     ("module", NameExtractor::Field("name")),
+                ],
+            },
+            // PHP
+            LangConfig {
+                language: tree_sitter_php::LANGUAGE_PHP.into(),
+                extensions: &["php"],
+                symbol_queries: vec![
+                    ("function_definition", NameExtractor::Field("name")),
+                    ("method_declaration", NameExtractor::Field("name")),
+                    ("class_declaration", NameExtractor::Field("name")),
+                    ("interface_declaration", NameExtractor::Field("name")),
+                    ("trait_declaration", NameExtractor::Field("name")),
+                    ("enum_declaration", NameExtractor::Field("name")),
                 ],
             },
         ]
@@ -817,5 +830,46 @@ end
         find_sym(&symbols, "initialize");
         find_sym(&symbols, "bark");
         find_sym(&symbols, "Helpers");
+    }
+
+    // ── 20. PHP ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_php() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "app.php", r#"<?php
+class UserController {
+    public function index() {
+        return "list";
+    }
+
+    public function store(Request $request) {
+        return "created";
+    }
+}
+
+interface Authenticatable {
+    public function getAuthIdentifier();
+}
+
+trait HasRoles {
+    public function hasRole(string $role): bool {
+        return true;
+    }
+}
+
+function helper_function() {
+    return 42;
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "UserController");
+        find_sym(&symbols, "index");
+        find_sym(&symbols, "store");
+        find_sym(&symbols, "Authenticatable");
+        find_sym(&symbols, "HasRoles");
+        find_sym(&symbols, "helper_function");
     }
 }
