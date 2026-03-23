@@ -47,7 +47,10 @@ impl SymbolIndex {
         let mut parser = Parser::new();
 
         for config in &configs {
-            parser.set_language(&config.language)?;
+            if let Err(e) = parser.set_language(&config.language) {
+                eprintln!("  warn: skipping language {:?}: {}", config.extensions, e);
+                continue;
+            }
 
             for ext in config.extensions {
                 let pattern = format!("{}/**/*.{}", self.repo_root.display(), ext);
