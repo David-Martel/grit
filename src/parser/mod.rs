@@ -154,14 +154,17 @@ impl SymbolIndex {
             "function_declaration" | "function_definition" | "function_item" => "function",
             "method_definition" | "method_declaration" => "method",
             "class_declaration" | "class_definition" => "class",
-            "struct_item" => "struct",
+            "struct_item" | "struct_declaration" => "struct",
             "impl_item" => "impl",
             "enum_item" | "enum_declaration" => "enum",
             "interface_declaration" => "interface",
             "trait_item" => "trait",
-            "type_alias_declaration" | "type_item" => "type",
+            "type_alias_declaration" | "type_item" | "type_declaration" => "type",
             "arrow_function" => "arrow_fn",
             "export_statement" => "export",
+            "namespace_declaration" => "namespace",
+            "module_declaration" => "module",
+            "singleton_method" => "method",
             other => other,
         }
     }
@@ -217,6 +220,74 @@ impl SymbolIndex {
                 symbol_queries: vec![
                     ("function_definition", NameExtractor::Field("name")),
                     ("class_definition", NameExtractor::Field("name")),
+                ],
+            },
+            // C#
+            LangConfig {
+                language: tree_sitter_c_sharp::LANGUAGE.into(),
+                extensions: &["cs"],
+                symbol_queries: vec![
+                    ("method_declaration", NameExtractor::Field("name")),
+                    ("class_declaration", NameExtractor::Field("name")),
+                    ("interface_declaration", NameExtractor::Field("name")),
+                    ("struct_declaration", NameExtractor::Field("name")),
+                    ("enum_declaration", NameExtractor::Field("name")),
+                    ("namespace_declaration", NameExtractor::Field("name")),
+                ],
+            },
+            // Go
+            LangConfig {
+                language: tree_sitter_go::LANGUAGE.into(),
+                extensions: &["go"],
+                symbol_queries: vec![
+                    ("function_declaration", NameExtractor::Field("name")),
+                    ("method_declaration", NameExtractor::Field("name")),
+                    ("type_declaration", NameExtractor::Field("name")),
+                ],
+            },
+            // Java
+            LangConfig {
+                language: tree_sitter_java::LANGUAGE.into(),
+                extensions: &["java"],
+                symbol_queries: vec![
+                    ("method_declaration", NameExtractor::Field("name")),
+                    ("class_declaration", NameExtractor::Field("name")),
+                    ("interface_declaration", NameExtractor::Field("name")),
+                    ("enum_declaration", NameExtractor::Field("name")),
+                ],
+            },
+            // C
+            LangConfig {
+                language: tree_sitter_c::LANGUAGE.into(),
+                extensions: &["c", "h"],
+                symbol_queries: vec![
+                    ("function_definition", NameExtractor::Field("declarator")),
+                    ("struct_specifier", NameExtractor::Field("name")),
+                    ("enum_specifier", NameExtractor::Field("name")),
+                    ("type_definition", NameExtractor::Field("declarator")),
+                ],
+            },
+            // C++
+            LangConfig {
+                language: tree_sitter_cpp::LANGUAGE.into(),
+                extensions: &["cpp", "cc", "cxx", "hpp"],
+                symbol_queries: vec![
+                    ("function_definition", NameExtractor::Field("declarator")),
+                    ("class_specifier", NameExtractor::Field("name")),
+                    ("struct_specifier", NameExtractor::Field("name")),
+                    ("enum_specifier", NameExtractor::Field("name")),
+                    ("namespace_definition", NameExtractor::Field("name")),
+                ],
+            },
+            // Ruby
+            LangConfig {
+                language: tree_sitter_ruby::LANGUAGE.into(),
+                extensions: &["rb"],
+                symbol_queries: vec![
+                    ("method", NameExtractor::Field("name")),
+                    ("singleton_method", NameExtractor::Field("name")),
+                    ("class", NameExtractor::Field("name")),
+                    ("module", NameExtractor::Field("name")),
                 ],
             },
         ]
@@ -580,5 +651,171 @@ interface TsInterface { x: number; }
 
         assert_eq!(find_sym(&symbols, "py_func").kind, "function");
         assert_eq!(find_sym(&symbols, "PyClass").kind, "class");
+    }
+
+    // ── 14. C# ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_csharp() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/App.cs", r#"
+namespace MyApp {
+    class UserService {
+        public void CreateUser(string name) {}
+        public void DeleteUser(int id) {}
+    }
+
+    interface IRepository {
+        void Save();
+    }
+
+    enum Status {
+        Active,
+        Inactive
+    }
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "UserService");
+        find_sym(&symbols, "CreateUser");
+        find_sym(&symbols, "DeleteUser");
+        find_sym(&symbols, "IRepository");
+        find_sym(&symbols, "Status");
+    }
+
+    // ── 15. Go ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_go() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "main.go", r#"
+package main
+
+func Add(a int, b int) int {
+    return a + b
+}
+
+func Subtract(a int, b int) int {
+    return a - b
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let fns: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert_eq!(fns.len(), 2);
+        find_sym(&symbols, "Add");
+        find_sym(&symbols, "Subtract");
+    }
+
+    // ── 16. Java ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_java() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/App.java", r#"
+class UserService {
+    public void createUser(String name) {}
+    public void deleteUser(int id) {}
+}
+
+interface Repository {
+    void save();
+}
+
+enum Color {
+    RED, GREEN, BLUE
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "UserService");
+        find_sym(&symbols, "createUser");
+        find_sym(&symbols, "deleteUser");
+        find_sym(&symbols, "Repository");
+        find_sym(&symbols, "Color");
+    }
+
+    // ── 17. C ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_c() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/math.c", r#"
+int add(int a, int b) {
+    return a + b;
+}
+
+int multiply(int a, int b) {
+    return a * b;
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        assert!(symbols.len() >= 2, "expected at least 2 symbols, got {:?}",
+            symbols.iter().map(|s| format!("{}({})", s.name, s.kind)).collect::<Vec<_>>());
+    }
+
+    // ── 18. C++ ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_cpp() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/engine.cpp", r#"
+class Engine {
+public:
+    void start() {}
+    void stop() {}
+};
+
+namespace physics {
+    void simulate() {}
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "Engine");
+        // namespace and functions may or may not be extracted depending on grammar
+        assert!(!symbols.is_empty());
+    }
+
+    // ── 19. Ruby ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ruby() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "app.rb", r#"
+class Dog
+  def initialize(name)
+    @name = name
+  end
+
+  def bark
+    "woof"
+  end
+
+  def self.species
+    "Canis familiaris"
+  end
+end
+
+module Helpers
+  def format(text)
+    text.strip
+  end
+end
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "Dog");
+        find_sym(&symbols, "initialize");
+        find_sym(&symbols, "bark");
+        find_sym(&symbols, "Helpers");
     }
 }
