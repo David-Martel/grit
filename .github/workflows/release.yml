@@ -168,7 +168,7 @@ jobs:
             desc "Coordination layer for parallel AI agents on top of git"
             homepage "https://github.com/rtk-ai/grit"
             version "VERSION_PLACEHOLDER"
-            license "LicenseRef-Source-Available"
+            license "Apache-2.0"
 
             on_macos do
               on_intel do

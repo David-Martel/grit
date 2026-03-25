@@ -156,6 +156,6 @@ TypeScript, JavaScript, Rust, Python (extensible via tree-sitter grammars)
 
 ## License
 
-Source-Available — Free for individuals and teams ≤20 people. Enterprise use requires a license. See [LICENSE](LICENSE) for details.
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
 Copyright (c) 2025-2026 RTK AI. All rights reserved.
