@@ -62,13 +62,13 @@ Grit locks at the **function level** (AST), not the file level (lines). Differen
        │               │               │
        ▼               ▼               ▼
   ┌──────────┐    ┌──────────┐    ┌──────────┐
-  │ SQLite   │    │ .grit/   │    │ Serial   │
-  │ or S3    │    │ worktrees│    │ file lock│
-  │ lock DB  │    │ /agent-N │    │ → merge  │
+  │ SQLite,  │    │ .grit/   │    │ Serial   │
+  │ Azure or │    │ worktrees│    │ file lock│
+  │ S3 store │    │ /agent-N │    │ → merge  │
   └──────────┘    └──────────┘    └──────────┘
 ```
 
-1. **Claim** — agent locks specific functions via SQLite (local) or S3 (distributed). Other agents are blocked from editing those functions.
+1. **Claim** — agent locks specific functions. Other agents are blocked from editing those functions.
 2. **Work** — each agent works in its own git worktree. Full isolation, true parallelism.
 3. **Done** — auto-commit, rebase on main, merge. Merges are serialized via file lock to prevent `index.lock` races.
 
@@ -91,6 +91,57 @@ Grit uses [tree-sitter](https://tree-sitter.github.io/) to parse ASTs. 13 langua
 | PHP | functions, methods, classes, interfaces, traits, enums |
 | Swift | functions, classes, structs, enums, protocols |
 | Kotlin | functions, classes, objects, interfaces |
+
+## Backends
+
+### Local (default)
+
+SQLite WAL for single-machine coordination. Zero setup.
+
+```bash
+grit config set-local
+```
+
+### Azure Blob Storage (recommended for teams)
+
+Native API with **atomic locking** (`If-None-Match: *`) and **free events** via Azure Event Grid. Every `claim` and `release` fires a `BlobCreated`/`BlobDeleted` event — no polling needed.
+
+```bash
+grit config set-azure \
+  --account <storage-account> \
+  --access-key <key> \
+  --container grit-locks
+```
+
+**Tested with 50 agents in parallel on Azure Blob Storage:**
+
+```
+Agents │ Merges │ Conflicts │ Locks left │ Azure blobs left │ Time
+───────┼────────┼───────────┼────────────┼──────────────────┼──────
+    10 │     20 │         0 │          0 │                0 │   6s
+    20 │     40 │         0 │          0 │                0 │   6s
+    30 │     54 │         0 │          0 │                0 │  11s
+    50 │     54 │         0 │          0 │                0 │  11s
+    50 │     76 │         0 │          0 │                0 │  24s  (pi-calc, 44 symbols)
+```
+
+### S3-Compatible (AWS, R2, MinIO)
+
+Works with any S3-compatible provider. Atomic locking via conditional PUT on AWS S3 and Cloudflare R2.
+
+```bash
+grit config set-s3 \
+  --bucket my-bucket \
+  --endpoint https://... \
+  --region auto
+```
+
+| Provider | Atomic Locking | Events |
+|----------|:---:|:---:|
+| **Azure Blob** | `If-None-Match` (native) | Event Grid (free, 100K/mo) |
+| **AWS S3** | `If-None-Match` (native) | S3 Event Notifications |
+| **Cloudflare R2** | `If-None-Match` (native) | — |
+| **MinIO** | GET-then-PUT (fallback) | — |
 
 ## Install
 
@@ -171,21 +222,24 @@ grit session pr                      # Push branch + create GitHub PR
 grit session end                     # Cleanup, back to base branch
 ```
 
-### Monitoring
+### Monitoring & Events
 
 ```bash
 grit watch                           # Real-time event stream (Unix socket)
-grit watch --poll 5                  # Polling mode (for S3 distributed backend)
+grit watch --poll 5                  # Polling mode (for S3/distributed backends)
 grit gc                              # Clean expired locks
 grit heartbeat -a <agent> --ttl 900  # Refresh lock TTL
 ```
 
+On Azure, events are automatic via Event Grid — every `claim` fires `BlobCreated`, every `release` fires `BlobDeleted`. Agents can subscribe to these events for real-time coordination without polling.
+
 ### Backend Configuration
 
 ```bash
-grit config show                     # Current config
-grit config set-local                # SQLite WAL (default)
-grit config set-s3 --bucket my-bucket --endpoint https://... --region auto
+grit config show                                                          # Current config
+grit config set-local                                                     # SQLite WAL (default)
+grit config set-azure --account <name> --access-key <key> --container <c> # Azure Blob
+grit config set-s3 --bucket <name> --endpoint <url> --region <r>          # S3/R2/MinIO
 ```
 
 ## Architecture
@@ -196,8 +250,8 @@ grit config set-s3 --bucket my-bucket --endpoint https://... --region auto
 ├──────────────────────────────────────────┤
 │  .grit/                                  │
 │  ├── registry.db    (SQLite WAL)         │  ← symbols + locks + deps + queue
-│  ├── config.json                         │  ← backend config (local/S3)
-│  ├── room.sock      (Unix socket)        │  ← real-time events
+│  ├── config.json                         │  ← backend config
+│  ├── room.sock      (Unix socket)        │  ← real-time events (local)
 │  ├── merge.lock     (file lock)          │  ← serializes git merges
 │  └── worktrees/                          │
 │      ├── agent-1/   (git worktree)       │  ← isolated working dir
@@ -206,10 +260,9 @@ grit config set-s3 --bucket my-bucket --endpoint https://... --region auto
 ├──────────────────────────────────────────┤
 │  Backends:                               │
 │  ├── Local: SQLite WAL (default)         │
+│  ├── Azure Blob Storage (native)         │  ← atomic + Event Grid
 │  ├── AWS S3 (conditional PUT)            │
 │  ├── Cloudflare R2                       │
-│  ├── Google Cloud Storage                │
-│  ├── Azure Blob Storage                  │
 │  └── MinIO (self-hosted)                 │
 └──────────────────────────────────────────┘
 ```
