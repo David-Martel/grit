@@ -64,7 +64,7 @@ for PROJECT in $PROJECTS; do
 
             for ROUND in $(seq 1 $NUM_ROUNDS); do
                 WORK=$(mktemp -d)
-                setup_work_repo "$PROJECT" "$WORK"
+                setup_git_repo "$PROJECT" "$WORK"
 
                 mapfile -t SYMS < <(sqlite3 "$SYM_DB" "SELECT id FROM symbols WHERE kind IN ('function','method') ORDER BY RANDOM()")
                 TOTAL=${#SYMS[@]}

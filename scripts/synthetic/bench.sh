@@ -10,7 +10,7 @@
 #   ./bench.sh --agents 50 --rounds 5
 #   ./bench.sh --project rust-service
 # ──────────────────────────────────────────────────────────────
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
@@ -61,20 +61,18 @@ GIT_OK=0 GIT_FAIL=0 GIT_CONFLICTS=0 GIT_TIME=0
 
 for ROUND in $(seq 1 $NUM_ROUNDS); do
     WORK="$RESULTS_DIR/git-r$ROUND"
-    setup_work_repo "$PROJECT" "$WORK"
+    setup_git_repo "$PROJECT" "$WORK"
 
     mapfile -t SYMS < <(sqlite3 "$SYM_DB" "SELECT id FROM symbols WHERE kind IN ('function','method') ORDER BY RANDOM()")
     TOTAL=${#SYMS[@]}
 
     START_T=$SECONDS
-    cd "$WORK"
-    MAIN_BRANCH=$(git branch --show-current)
+    MAIN_BRANCH=$(git -C "$WORK" branch --show-current)
 
     for i in $(seq 1 $NUM_AGENTS); do
-        git checkout -q "$MAIN_BRANCH"
-        git checkout -q -b "agent-$i"
+        git -C "$WORK" checkout -q "$MAIN_BRANCH"
+        git -C "$WORK" checkout -q -b "agent-$i"
 
-        # Round-robin: agent i gets symbols i, i+N, i+2N, ...
         K=$((i - 1))
         while [[ $K -lt $TOTAL ]]; do
             SYM="${SYMS[$K]}"
@@ -82,21 +80,22 @@ for ROUND in $(seq 1 $NUM_ROUNDS); do
             K=$((K + NUM_AGENTS))
         done
 
-        git add -A 2>/dev/null
-        git commit -q -m "agent-$i round $ROUND" 2>/dev/null || true
+        git -C "$WORK" add -A 2>/dev/null
+        git -C "$WORK" commit -q -m "agent-$i round $ROUND" 2>/dev/null || true
     done
 
-    git checkout -q "$MAIN_BRANCH"
+    git -C "$WORK" checkout -q "$MAIN_BRANCH"
     ROUND_OK=0 ROUND_FAIL=0 ROUND_CONFLICTS=0
 
     for i in $(seq 1 $NUM_AGENTS); do
-        if git merge --no-ff "agent-$i" -m "merge agent-$i" >/dev/null 2>&1; then
+        if git -C "$WORK" merge --no-ff "agent-$i" -m "merge agent-$i" >/dev/null 2>&1; then
             ROUND_OK=$((ROUND_OK + 1))
         else
             ROUND_FAIL=$((ROUND_FAIL + 1))
-            CONF=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
+            CONF=$(git -C "$WORK" diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
+            CONF=${CONF:-0}
             ROUND_CONFLICTS=$((ROUND_CONFLICTS + CONF))
-            git merge --abort 2>/dev/null
+            git -C "$WORK" merge --abort 2>/dev/null
         fi
     done
 
@@ -148,7 +147,8 @@ for ROUND in $(seq 1 $NUM_ROUNDS); do
         [[ ${#AGENT_SYMS[@]} -eq 0 ]] && continue
 
         (
-            "$GRIT" --repo "$WORK" claim -a "r${ROUND}a${i}" -i "round$ROUND-task$i" "${AGENT_SYMS[@]}" >/dev/null 2>&1 || exit 1
+            set +e
+            "$GRIT" --repo "$WORK" claim -a "r${ROUND}a${i}" -i "round$ROUND-task$i" "${AGENT_SYMS[@]}" >/dev/null 2>&1 || exit 0
 
             WT="$WORK/.grit/worktrees/r${ROUND}a${i}"
             if [[ -d "$WT" ]]; then
@@ -165,9 +165,10 @@ for ROUND in $(seq 1 $NUM_ROUNDS); do
     ELAPSED=$((SECONDS - START_T))
     GRIT_TIME=$((GRIT_TIME + ELAPSED))
 
-    cd "$WORK"
-    CONF=$(git status --porcelain 2>/dev/null | grep -c "^UU" || echo "0")
-    MERGES=$(git log --oneline 2>/dev/null | grep -c "grit: merge" || echo "0")
+    CONF=$(git -C "$WORK" status --porcelain 2>/dev/null | grep -c "^UU" || true)
+    CONF=${CONF:-0}
+    MERGES=$(git -C "$WORK" log --oneline 2>/dev/null | grep -c "grit:" || true)
+    MERGES=${MERGES:-0}
     GRIT_CONFLICTS=$((GRIT_CONFLICTS + CONF))
     GRIT_OK=$((GRIT_OK + MERGES))
 

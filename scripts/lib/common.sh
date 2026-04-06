@@ -28,21 +28,28 @@ ensure_grit() {
     ok "grit: $GRIT"
 }
 
-# Create a work repo from a test project
-# Usage: setup_work_repo <project_name> <dest_dir>
-setup_work_repo() {
+# Create a bare git work repo from a test project (no grit init)
+# Usage: setup_git_repo <project_name> <dest_dir>
+setup_git_repo() {
     local project="$1" dest="$2"
     local src="$REPO_ROOT/test-projects/$project"
     [[ -d "$src" ]] || { err "Test project not found: $src"; return 1; }
 
     rm -rf "$dest"
     cp -r "$src" "$dest"
-    cd "$dest"
-    git init -q
-    git add -A
-    git commit -q -m "init"
-    "$GRIT" --repo "$dest" init >/dev/null 2>&1
-    cd - >/dev/null
+    (
+        cd "$dest"
+        git init -q
+        git add -A
+        git commit -q -m "init"
+    )
+}
+
+# Create a work repo with grit initialized
+# Usage: setup_work_repo <project_name> <dest_dir>
+setup_work_repo() {
+    setup_git_repo "$1" "$2"
+    "$GRIT" --repo "$2" init >/dev/null 2>&1
 }
 
 # Get symbol count from a grit repo
