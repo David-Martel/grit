@@ -1,6 +1,7 @@
 pub mod lock_store;
 pub mod sqlite_store;
 pub mod s3_store;
+pub mod azure_store;
 
 use anyhow::Result;
 use rusqlite::{Connection, params};

@@ -3,14 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::db::s3_store::S3Config;
+use crate::db::azure_store::AzureConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GritConfig {
-    /// "local" or "s3"
+    /// "local", "s3", or "azure"
     pub backend: String,
-    /// S3-compatible config (for R2, GCS, Azure S3, MinIO, AWS S3)
+    /// S3-compatible config (for R2, MinIO, AWS S3, GCS S3-compat)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<S3Config>,
+    /// Azure Blob Storage config (native API with Event Grid)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureConfig>,
 }
 
 impl Default for GritConfig {
@@ -18,6 +22,7 @@ impl Default for GritConfig {
         Self {
             backend: "local".to_string(),
             s3: None,
+            azure: None,
         }
     }
 }
@@ -70,6 +75,7 @@ mod tests {
         let config = GritConfig {
             backend: "local".to_string(),
             s3: None,
+            azure: None,
         };
         config.save(tmp.path()).unwrap();
         let loaded = GritConfig::load(tmp.path()).unwrap();
@@ -107,6 +113,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 endpoint: Some("https://custom.endpoint.com".to_string()),
             }),
+            azure: None,
         };
         config.save(tmp.path()).unwrap();
         let loaded = GritConfig::load(tmp.path()).unwrap();

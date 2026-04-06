@@ -8,6 +8,7 @@ use crate::db::Database;
 use crate::db::lock_store::{LockEntry, LockStore, LockResult};
 use crate::db::sqlite_store::SqliteLockStore;
 use crate::db::s3_store::S3Config;
+use crate::db::azure_store::AzureConfig;
 use crate::git::GitRepo;
 use crate::parser::SymbolIndex;
 use crate::room::{Room, RoomEvent, EventType, NotificationServer};
@@ -225,6 +226,18 @@ pub enum ConfigAction {
         #[arg(long, default_value = "auto")]
         region: String,
     },
+    /// Set backend to Azure Blob Storage (native API with Event Grid)
+    SetAzure {
+        /// Storage account name
+        #[arg(long)]
+        account: String,
+        /// Access key
+        #[arg(long)]
+        access_key: String,
+        /// Container name
+        #[arg(long, default_value = "grit-locks")]
+        container: String,
+    },
     /// Set backend to local SQLite (default)
     SetLocal,
     /// Show current config
@@ -293,6 +306,7 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Config { action } => match action {
             ConfigAction::SetS3 { bucket, endpoint, region } => cmd_config_set_s3(&cli.repo, &bucket, endpoint.as_deref(), &region),
+            ConfigAction::SetAzure { account, access_key, container } => cmd_config_set_azure(&cli.repo, &account, &access_key, &container),
             ConfigAction::SetLocal => cmd_config_set_local(&cli.repo),
             ConfigAction::Show => cmd_config_show(&cli.repo),
         },
@@ -335,6 +349,13 @@ fn resolve_lock_store(repo: &str) -> Result<Box<dyn LockStore>> {
                 "S3 backend configured but no S3 config found. Run: grit config set-s3 --bucket <name>"
             ))?;
             let store = crate::db::s3_store::S3LockStore::from_config(&s3_config)?;
+            Ok(Box::new(store))
+        }
+        "azure" => {
+            let azure_config = config.azure.ok_or_else(|| anyhow::anyhow!(
+                "Azure backend configured but no Azure config found. Run: grit config set-azure --account <name> --access-key <key>"
+            ))?;
+            let store = crate::db::azure_store::AzureLockStore::from_config(&azure_config)?;
             Ok(Box::new(store))
         }
         _ => {
@@ -1248,6 +1269,7 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
             region: Some(region.to_string()),
             prefix: None,
         }),
+        azure: None,
     };
     config.save(&dir)?;
 
@@ -1268,11 +1290,35 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
     Ok(())
 }
 
+fn cmd_config_set_azure(repo: &str, account: &str, access_key: &str, container: &str) -> Result<()> {
+    let dir = ensure_initialized(repo)?;
+    let config = GritConfig {
+        backend: "azure".to_string(),
+        s3: None,
+        azure: Some(AzureConfig {
+            account: account.to_string(),
+            access_key: access_key.to_string(),
+            container: container.to_string(),
+            prefix: None,
+        }),
+    };
+    config.save(&dir)?;
+
+    println!("{} Backend set to Azure Blob Storage", "+".green());
+    println!("  account:   {}", account.cyan());
+    println!("  container: {}", container);
+    println!();
+    println!("Events: Azure Event Grid fires on every claim/release (free tier: 100K/mo)");
+
+    Ok(())
+}
+
 fn cmd_config_set_local(repo: &str) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let config = GritConfig {
         backend: "local".to_string(),
         s3: None,
+        azure: None,
     };
     config.save(&dir)?;
 
@@ -1298,6 +1344,10 @@ fn cmd_config_show(repo: &str) -> Result<()> {
         if let Some(ref r) = s3.region {
             println!("  s3.region:   {}", r);
         }
+    }
+    if let Some(ref az) = config.azure {
+        println!("  azure.account:   {}", az.account);
+        println!("  azure.container: {}", az.container);
     }
 
     Ok(())
