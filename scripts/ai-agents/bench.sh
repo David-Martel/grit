@@ -145,7 +145,11 @@ IMPORTANT:
 
         log "  agent-$i: ${#SYMS[@]} symbols (${SYMS[0]%::*}...)"
 
-        "$PROVIDER" -p "$AGENT_PROMPT" > "$RESULTS_DIR/agent-$i.log" 2>&1 &
+        if [[ "$PROVIDER" == "gemini" ]]; then
+            $PROVIDER --yolo -p "$AGENT_PROMPT" > "$RESULTS_DIR/agent-$i.log" 2>&1 &
+        else
+            $PROVIDER -p "$AGENT_PROMPT" > "$RESULTS_DIR/agent-$i.log" 2>&1 &
+        fi
         PIDS+=($!)
 
         # Stagger launches
