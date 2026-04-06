@@ -50,6 +50,14 @@ pub enum Command {
         #[arg(long, default_value = "write")]
         mode: String,
 
+        /// If blocked, queue up instead of failing (FIFO, auto-granted when released)
+        #[arg(long)]
+        queue: bool,
+
+        /// Also lock all callees as read (dependency-aware locking)
+        #[arg(long)]
+        with_deps: bool,
+
         /// Symbols to claim (e.g. "auth.ts::login" "utils.ts::hash")
         symbols: Vec<String>,
     },
@@ -92,13 +100,23 @@ pub enum Command {
         agent: String,
     },
 
-    /// Watch real-time events from the room socket
-    Watch,
+    /// Watch real-time events from the room socket (or poll S3)
+    Watch {
+        /// Poll interval in seconds for S3 backend (default: uses Unix socket for local)
+        #[arg(long)]
+        poll: Option<u64>,
+    },
 
     /// Manage git worktrees
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+
+    /// Manage the lock queue
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
     },
 
     /// Garbage-collect expired locks
@@ -114,6 +132,29 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Auto-pick and claim a free symbol from a file
+    Assign {
+        /// Agent identifier
+        #[arg(short, long)]
+        agent: String,
+
+        /// Intent description (what you plan to do)
+        #[arg(short, long)]
+        intent: String,
+
+        /// File pattern to search for symbols
+        #[arg(short, long)]
+        file: String,
+
+        /// TTL in seconds (default: 600)
+        #[arg(long, default_value = "600")]
+        ttl: u64,
+
+        /// Lock mode: "read" for shared access, "write" for exclusive (default: write)
+        #[arg(long, default_value = "write")]
+        mode: String,
     },
 
     /// Refresh an agent's lock TTL
@@ -153,6 +194,20 @@ pub enum SessionAction {
     End {
         /// Session name
         name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum QueueAction {
+    /// List all queued agents
+    List,
+    /// Cancel a queue entry for an agent
+    Cancel {
+        /// Agent identifier
+        #[arg(short, long)]
+        agent: String,
+        /// Symbol to dequeue from (optional: if omitted, dequeues all)
+        symbol: Option<String>,
     },
 }
 
@@ -205,7 +260,8 @@ pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Claim { agent, .. } | Command::Release { agent, .. }
         | Command::Done { agent } | Command::Plan { agent, .. }
-        | Command::Heartbeat { agent, .. } => validate_identifier(agent, "agent ID")?,
+        | Command::Heartbeat { agent, .. }
+        | Command::Assign { agent, .. } => validate_identifier(agent, "agent ID")?,
         Command::Session { action: SessionAction::Start { name } } => {
             validate_identifier(name, "session name")?;
         }
@@ -214,15 +270,19 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Init => cmd_init(&cli.repo),
-        Command::Claim { agent, intent, ttl, wait, mode, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, wait, &mode, &symbols),
+        Command::Claim { agent, intent, ttl, wait, mode, queue, with_deps, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, wait, &mode, queue, with_deps, &symbols),
         Command::Release { agent, symbols } => cmd_release(&cli.repo, &agent, &symbols),
         Command::Status => cmd_status(&cli.repo),
         Command::Symbols { file } => cmd_symbols(&cli.repo, file.as_deref()),
         Command::Plan { agent, intent } => cmd_plan(&cli.repo, &agent, &intent),
         Command::Done { agent } => cmd_done(&cli.repo, &agent),
-        Command::Watch => cmd_watch(&cli.repo),
+        Command::Watch { poll } => cmd_watch(&cli.repo, poll),
         Command::Worktree { action } => match action {
             WorktreeAction::List => cmd_worktree_list(&cli.repo),
+        },
+        Command::Queue { action } => match action {
+            QueueAction::List => cmd_queue_list(&cli.repo),
+            QueueAction::Cancel { agent, symbol } => cmd_queue_cancel(&cli.repo, &agent, symbol.as_deref()),
         },
         Command::Gc => cmd_gc(&cli.repo),
         Command::Session { action } => match action {
@@ -237,6 +297,7 @@ pub fn run(cli: Cli) -> Result<()> {
             ConfigAction::Show => cmd_config_show(&cli.repo),
         },
         Command::Heartbeat { agent, ttl } => cmd_heartbeat(&cli.repo, &agent, ttl),
+        Command::Assign { agent, intent, file, ttl, mode } => cmd_assign(&cli.repo, &agent, &intent, &file, ttl, &mode),
     }
 }
 
@@ -291,11 +352,13 @@ fn cmd_init(repo: &str) -> Result<()> {
     let db = Database::open(&dir.join("registry.db"))?;
     db.init_schema()?;
 
-    // Parse and index all symbols
+    // Parse and index all symbols + dependencies
     let index = SymbolIndex::new(repo)?;
-    let symbols = index.scan_all()?;
+    let (symbols, deps) = index.scan_with_deps()?;
     let count = symbols.len();
+    let dep_count = deps.len();
     db.upsert_symbols(&symbols)?;
+    db.upsert_deps(&deps)?;
 
     // Add .grit to .gitignore if not already there
     let gitignore = std::path::Path::new(repo).join(".gitignore");
@@ -317,12 +380,13 @@ fn cmd_init(repo: &str) -> Result<()> {
 
     println!("grit initialized");
     println!("  {} symbols indexed", count);
+    println!("  {} dependencies found", dep_count);
     println!("  registry: {}", dir.join("registry.db").display());
 
     Ok(())
 }
 
-fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &str, symbols: &[String]) -> Result<()> {
+fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &str, queue: bool, with_deps: bool, symbols: &[String]) -> Result<()> {
     if mode != "read" && mode != "write" {
         anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
     }
@@ -330,6 +394,35 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
     let db = Database::open(&dir.join("registry.db"))?; // for symbol queries
+
+    // If --with-deps, expand symbols to include transitive callees (locked as read)
+    let mut dep_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let symbols = if with_deps {
+        let mut expanded = symbols.to_vec();
+        for sym_id in symbols {
+            match db.get_transitive_deps(sym_id) {
+                Ok(deps) => {
+                    for dep in deps {
+                        if !expanded.contains(&dep) {
+                            dep_set.insert(dep.clone());
+                            expanded.push(dep);
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if !dep_set.is_empty() {
+            println!("{} Auto-locking {} dependencies as read:", "+".cyan(), dep_set.len());
+            for d in &dep_set {
+                println!("  {} {}", ">".cyan(), d);
+            }
+        }
+        expanded
+    } else {
+        symbols.to_vec()
+    };
+    let symbols = &symbols;
 
     let deadline = if wait > 0 {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(wait))
@@ -343,7 +436,9 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
         let mut blocked = Vec::new();
 
         for sym_id in symbols {
-            match lock_store.try_lock(sym_id, agent, intent, ttl, mode)? {
+            // Deps are always claimed as read locks
+            let sym_mode = if dep_set.contains(sym_id) { "read" } else { mode };
+            match lock_store.try_lock(sym_id, agent, intent, ttl, sym_mode)? {
                 LockResult::Granted => granted.push(sym_id.clone()),
                 LockResult::Blocked { by_agent, by_intent } => {
                     blocked.push((sym_id.clone(), by_agent, by_intent));
@@ -388,9 +483,18 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
             }
 
             if !blocked.is_empty() {
-                println!("{} Blocked:", "x".red());
-                for (s, by, intent) in &blocked {
-                    println!("  {} {} -- held by {} ({})", ">".red(), s, by, intent);
+                if queue {
+                    // Enqueue blocked symbols
+                    for (s, by, by_intent) in &blocked {
+                        db.enqueue(s, agent, intent, mode)?;
+                        let pos = db.queue_position(s, agent)?.unwrap_or(0);
+                        println!("{} Queued: {} (position {}, held by {} - {})", "~".yellow(), s, pos, by, by_intent);
+                    }
+                } else {
+                    println!("{} Blocked:", "x".red());
+                    for (s, by, intent) in &blocked {
+                        println!("  {} {} -- held by {} ({})", ">".red(), s, by, intent);
+                    }
                 }
 
                 let files: Vec<&str> = symbols.iter().filter_map(|s| s.split("::").next()).collect();
@@ -403,7 +507,7 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
                 }
             }
 
-            return if blocked.is_empty() {
+            return if blocked.is_empty() || queue {
                 Ok(())
             } else {
                 anyhow::bail!("Some symbols are blocked")
@@ -435,29 +539,57 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
 fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?;
 
-    if symbols.is_empty() {
+    let released_symbols = if symbols.is_empty() {
+        // Get all symbols held by this agent before releasing (for queue promotion)
+        let held = lock_store.locks_for_agent(agent)?;
+        let syms: Vec<String> = held.iter().map(|(s, _)| s.clone()).collect();
         let released = lock_store.release_all(agent)?;
         println!("Released {} symbols for {}", released, agent);
+        syms
     } else {
         for sym_id in symbols {
             lock_store.release(sym_id, agent)?;
             println!("Released {}", sym_id);
         }
-    }
-
-    let room = Room::new(&dir);
-    let released_symbols = if symbols.is_empty() {
-        vec!["(all)".to_string()]
-    } else {
         symbols.to_vec()
     };
+
+    // Promote queued agents for released symbols
+    promote_queued(&db, lock_store.as_ref(), &released_symbols, &dir)?;
+
+    let room = Room::new(&dir);
     room.notify(&RoomEvent {
         event_type: EventType::Released,
         agent: agent.to_string(),
-        symbols: released_symbols,
+        symbols: if symbols.is_empty() { vec!["(all)".to_string()] } else { symbols.to_vec() },
     });
 
+    Ok(())
+}
+
+/// Promote the next queued agent for each released symbol
+fn promote_queued(db: &Database, lock_store: &dyn LockStore, symbols: &[String], grit_dir: &std::path::Path) -> Result<()> {
+    let room = Room::new(grit_dir);
+    for sym_id in symbols {
+        if let Some((next_agent, next_intent, next_mode)) = db.next_in_queue(sym_id)? {
+            match lock_store.try_lock(sym_id, &next_agent, &next_intent, 600, &next_mode)? {
+                LockResult::Granted => {
+                    db.dequeue(sym_id, &next_agent)?;
+                    println!("{} Auto-granted {} to {} (from queue)", "+".green(), sym_id, next_agent);
+                    room.notify(&RoomEvent {
+                        event_type: EventType::Claimed,
+                        agent: next_agent,
+                        symbols: vec![sym_id.clone()],
+                    });
+                }
+                LockResult::Blocked { .. } => {
+                    // Still blocked (e.g., another lock mode conflict), leave in queue
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -500,9 +632,11 @@ fn cmd_status(repo: &str) -> Result<()> {
 
     let total_symbols = db.count_symbols()?;
     let locked_count = locks.len();
+    let queue_count = db.list_queue()?.len();
     println!(
-        "\n{}/{} symbols locked",
-        locked_count, total_symbols
+        "\n{}/{} symbols locked{}",
+        locked_count, total_symbols,
+        if queue_count > 0 { format!(", {} queued", queue_count) } else { String::new() }
     );
 
     Ok(())
@@ -557,6 +691,14 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
         println!("  {} {}::{} [{}] {}", ">".dimmed(), file, name, kind, status);
     }
 
+    // Show dependencies for each symbol
+    for (id, _, _, _, _) in &suggestions {
+        let deps = db.get_transitive_deps(id)?;
+        if !deps.is_empty() {
+            println!("  {} deps: {}", "|".dimmed(), deps.join(", "));
+        }
+    }
+
     let free: Vec<&String> = suggestions
         .iter()
         .filter(|(_, _, _, _, l)| l.is_none())
@@ -570,6 +712,12 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
             intent,
             free.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(" ")
         );
+        println!(
+            "\nClaim with deps:\n  grit claim -a {} -i \"{}\" --with-deps {}",
+            agent,
+            intent,
+            free.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(" ")
+        );
     }
 
     Ok(())
@@ -578,6 +726,7 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
 fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?;
 
     let locks = lock_store.locks_for_agent(agent)?;
     if locks.is_empty() {
@@ -625,15 +774,25 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     }
 
     // Release locks regardless of merge outcome
+    let released_symbols: Vec<String> = locks.iter().map(|(s, _)| s.clone()).collect();
     let released = lock_store.release_all(agent)?;
     println!("{} Released {} symbols", "+".green(), released);
+
+    // Also clear any queue entries for this agent
+    let dequeued = db.dequeue_all(agent)?;
+    if dequeued > 0 {
+        println!("{} Removed {} queue entries", "+".green(), dequeued);
+    }
+
+    // Promote queued agents for released symbols
+    promote_queued(&db, lock_store.as_ref(), &released_symbols, &dir)?;
 
     // Notify
     let room = Room::new(&dir);
     room.notify(&RoomEvent {
         event_type: EventType::AgentDone,
         agent: agent.to_string(),
-        symbols: locks.iter().map(|(s, _)| s.clone()).collect(),
+        symbols: released_symbols,
     });
 
     // Report merge failure after cleanup is complete
@@ -648,8 +807,15 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_watch(repo: &str) -> Result<()> {
+fn cmd_watch(repo: &str, poll: Option<u64>) -> Result<()> {
     let dir = ensure_initialized(repo)?;
+    let config = GritConfig::load(&dir)?;
+
+    // For S3 backend or explicit --poll, use polling mode
+    if poll.is_some() || config.backend == "s3" {
+        return cmd_watch_poll(repo, poll.unwrap_or(5));
+    }
+
     let sock_path = dir.join("room.sock");
 
     if !sock_path.exists() {
@@ -692,18 +858,7 @@ fn cmd_watch(repo: &str) -> Result<()> {
                 }
                 match serde_json::from_str::<RoomEvent>(&data) {
                     Ok(event) => {
-        
-                        let prefix = match event.event_type {
-                            EventType::Claimed => "CLAIMED".green(),
-                            EventType::Released => "RELEASED".yellow(),
-                            EventType::AgentDone => "DONE".cyan(),
-                        };
-                        println!(
-                            "[{}] agent={} symbols=[{}]",
-                            prefix,
-                            event.agent,
-                            event.symbols.join(", ")
-                        );
+                        print_event(&event);
                     }
                     Err(_) => {
                         println!("  raw: {}", data);
@@ -718,6 +873,68 @@ fn cmd_watch(repo: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_event(event: &RoomEvent) {
+    let prefix = match event.event_type {
+        EventType::Claimed => "CLAIMED".green(),
+        EventType::Released => "RELEASED".yellow(),
+        EventType::AgentDone => "DONE".cyan(),
+    };
+    println!(
+        "[{}] agent={} symbols=[{}]",
+        prefix,
+        event.agent,
+        event.symbols.join(", ")
+    );
+}
+
+/// Poll-based watch: periodically diff the lock state and report changes
+fn cmd_watch_poll(repo: &str, interval_secs: u64) -> Result<()> {
+    let lock_store = resolve_lock_store(repo)?;
+
+    println!("Polling for lock changes every {}s (Ctrl+C to stop):\n", interval_secs);
+
+    // Build initial snapshot: symbol_id -> (agent_id, intent)
+    let mut prev: std::collections::HashMap<String, (String, String)> = lock_store
+        .all_locks()?
+        .into_iter()
+        .map(|e| (e.symbol_id.clone(), (e.agent_id.clone(), e.intent.clone())))
+        .collect();
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+
+        let current_locks = lock_store.all_locks()?;
+        let curr: std::collections::HashMap<String, (String, String)> = current_locks
+            .iter()
+            .map(|e| (e.symbol_id.clone(), (e.agent_id.clone(), e.intent.clone())))
+            .collect();
+
+        // Detect new locks (claimed)
+        for (sym, (agent, _intent)) in &curr {
+            if !prev.contains_key(sym) {
+                print_event(&RoomEvent {
+                    event_type: EventType::Claimed,
+                    agent: agent.clone(),
+                    symbols: vec![sym.clone()],
+                });
+            }
+        }
+
+        // Detect removed locks (released)
+        for (sym, (agent, _intent)) in &prev {
+            if !curr.contains_key(sym) {
+                print_event(&RoomEvent {
+                    event_type: EventType::Released,
+                    agent: agent.clone(),
+                    symbols: vec![sym.clone()],
+                });
+            }
+        }
+
+        prev = curr;
+    }
 }
 
 fn cmd_worktree_list(repo: &str) -> Result<()> {
@@ -739,6 +956,50 @@ fn cmd_worktree_list(repo: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_queue_list(repo: &str) -> Result<()> {
+    let dir = ensure_initialized(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?;
+
+    let entries = db.list_queue()?;
+    if entries.is_empty() {
+        println!("No agents in queue.");
+        return Ok(());
+    }
+
+    let mut current_symbol = String::new();
+    let mut pos = 0;
+    for (symbol_id, agent_id, intent, mode, queued_at) in &entries {
+        if symbol_id != &current_symbol {
+            current_symbol = symbol_id.clone();
+            pos = 0;
+            println!("\n{}", symbol_id.bold());
+        }
+        pos += 1;
+        let mode_str = if mode == "read" { " (read)" } else { "" };
+        println!("  {} #{} {} -- {}{} ({})", ">".yellow(), pos, agent_id, intent, mode_str, queued_at.dimmed());
+    }
+
+    Ok(())
+}
+
+fn cmd_queue_cancel(repo: &str, agent: &str, symbol: Option<&str>) -> Result<()> {
+    let dir = ensure_initialized(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?;
+
+    match symbol {
+        Some(sym) => {
+            db.dequeue(sym, agent)?;
+            println!("Removed {} from queue for {}", agent, sym);
+        }
+        None => {
+            let count = db.dequeue_all(agent)?;
+            println!("Removed {} queue entries for {}", count, agent);
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_gc(repo: &str) -> Result<()> {
     let lock_store = resolve_lock_store(repo)?;
 
@@ -750,6 +1011,71 @@ fn cmd_gc(repo: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_assign(repo: &str, agent: &str, intent: &str, file_pattern: &str, ttl: u64, mode: &str) -> Result<()> {
+    if mode != "read" && mode != "write" {
+        anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
+    }
+
+    let dir = ensure_initialized(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
+
+    // Find matching files
+    let all_symbols = db.list_symbols(Some(file_pattern))?;
+    if all_symbols.is_empty() {
+        anyhow::bail!("No symbols found matching file pattern '{}'", file_pattern);
+    }
+
+    // Get unique files
+    let files: Vec<&str> = all_symbols.iter().map(|(_, f, _, _, _)| f.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let available = db.available_symbols_in_files(&files)?;
+
+    if available.is_empty() {
+        anyhow::bail!("All symbols in matching files are locked. Try again later or use a different file pattern.");
+    }
+
+    // Pick the first available symbol and claim it
+    let symbol_id = &available[0];
+    match lock_store.try_lock(symbol_id, agent, intent, ttl, mode)? {
+        LockResult::Granted => {
+            // Create worktree
+            let git_repo = GitRepo::open(repo)?;
+            match git_repo.create_worktree(agent) {
+                Ok(wt_path) => {
+                    println!("{} Worktree: {}", "+".cyan(), wt_path.display());
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("already exists") {
+                        eprintln!("  warn: could not create worktree: {}", e);
+                    }
+                }
+            }
+
+            println!("{} Assigned: {}", "+".green(), symbol_id);
+            println!("  agent:  {}", agent);
+            println!("  intent: {}", intent);
+            println!("  mode:   {}", mode);
+
+            let room = Room::new(&dir);
+            room.notify(&RoomEvent {
+                event_type: EventType::Claimed,
+                agent: agent.to_string(),
+                symbols: vec![symbol_id.clone()],
+            });
+
+            Ok(())
+        }
+        LockResult::Blocked { by_agent, by_intent } => {
+            // Race condition — symbol was claimed between availability check and lock attempt
+            anyhow::bail!(
+                "Symbol {} was claimed by {} ({}) between check and lock. Try again.",
+                symbol_id, by_agent, by_intent
+            );
+        }
+    }
 }
 
 fn cmd_heartbeat(repo: &str, agent: &str, ttl: u64) -> Result<()> {
@@ -1091,7 +1417,7 @@ mod tests {
 
         // Agent-2 tries to claim with --wait 2 (should timeout after ~2s)
         let start = std::time::Instant::now();
-        let err = cmd_claim(repo, "agent-2", "want it", 600, 2, "write", &["main.rs::hello".to_string()]);
+        let err = cmd_claim(repo, "agent-2", "want it", 600, 2, "write", false, false, &["main.rs::hello".to_string()]);
         let elapsed = start.elapsed();
 
         // Should have failed (blocked)

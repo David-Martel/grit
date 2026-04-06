@@ -5,7 +5,7 @@ pub mod s3_store;
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use crate::parser::Symbol;
+use crate::parser::{Symbol, Dep};
 
 /// Apply standard PRAGMA settings to a new SQLite connection.
 pub fn configure_connection(conn: &Connection) -> Result<()> {
@@ -105,9 +105,19 @@ impl Database {
                 status      TEXT DEFAULT 'active'
             );
 
+            CREATE TABLE IF NOT EXISTS lock_queue (
+                symbol_id   TEXT NOT NULL,
+                agent_id    TEXT NOT NULL,
+                intent      TEXT,
+                mode        TEXT DEFAULT 'write',
+                queued_at   TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (symbol_id, agent_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_locks_agent ON locks(agent_id);
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
             CREATE INDEX IF NOT EXISTS idx_deps_callee ON deps(callee);
+            CREATE INDEX IF NOT EXISTS idx_queue_symbol ON lock_queue(symbol_id);
             "
         )?;
 
@@ -248,6 +258,119 @@ impl Database {
             params![name],
         )?;
         Ok(())
+    }
+
+    // ── Dependency management ──
+
+    pub fn upsert_deps(&self, deps: &[Dep]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            // Clear old deps first
+            tx.execute("DELETE FROM deps", [])?;
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO deps (caller, callee, kind) VALUES (?1, ?2, ?3)"
+            )?;
+            for d in deps {
+                stmt.execute(params![d.caller, d.callee, d.kind])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get direct callees of a symbol
+    #[allow(dead_code)]
+    pub fn get_deps(&self, symbol_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT callee, kind FROM deps WHERE caller = ?1"
+        )?;
+        let rows = stmt.query_map(params![symbol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get transitive callees (recursive) using WITH RECURSIVE CTE
+    pub fn get_transitive_deps(&self, symbol_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE dep_tree(sym) AS (
+                 SELECT callee FROM deps WHERE caller = ?1
+                 UNION
+                 SELECT d.callee FROM deps d JOIN dep_tree t ON d.caller = t.sym
+             )
+             SELECT DISTINCT sym FROM dep_tree"
+        )?;
+        let rows = stmt.query_map(params![symbol_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn count_deps(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM deps", [], |r| r.get(0))?;
+        Ok(count as usize)
+    }
+
+    // ── Queue management ──
+
+    pub fn enqueue(&self, symbol_id: &str, agent_id: &str, intent: &str, mode: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO lock_queue (symbol_id, agent_id, intent, mode) VALUES (?1, ?2, ?3, ?4)",
+            params![symbol_id, agent_id, intent, mode],
+        )?;
+        Ok(())
+    }
+
+    pub fn dequeue(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM lock_queue WHERE symbol_id = ?1 AND agent_id = ?2",
+            params![symbol_id, agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn dequeue_all(&self, agent_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM lock_queue WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        Ok(count)
+    }
+
+    /// Next agent in queue for a symbol (FIFO by queued_at)
+    pub fn next_in_queue(&self, symbol_id: &str) -> Result<Option<(String, String, String)>> {
+        let result = self.conn.query_row(
+            "SELECT agent_id, intent, COALESCE(mode, 'write') FROM lock_queue
+             WHERE symbol_id = ?1 ORDER BY queued_at ASC LIMIT 1",
+            params![symbol_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Queue position for an agent on a symbol (1-based, None if not queued)
+    pub fn queue_position(&self, symbol_id: &str, agent_id: &str) -> Result<Option<usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id FROM lock_queue WHERE symbol_id = ?1 ORDER BY queued_at ASC"
+        )?;
+        let agents: Vec<String> = stmt.query_map(params![symbol_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(agents.iter().position(|a| a == agent_id).map(|p| p + 1))
+    }
+
+    /// List all queued entries
+    pub fn list_queue(&self) -> Result<Vec<(String, String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_id, agent_id, intent, COALESCE(mode, 'write'), queued_at
+             FROM lock_queue ORDER BY symbol_id, queued_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
 }
@@ -419,5 +542,117 @@ mod tests {
         // Second open runs integrity check on existing DB
         let result = Database::open(&db_path);
         assert!(result.is_ok());
+    }
+
+    // ── Queue tests ──
+
+    #[test]
+    fn test_queue_enqueue_and_list() {
+        let (_tmp, db) = setup_db();
+        db.enqueue("sym::a", "agent-1", "want to edit", "write").unwrap();
+        db.enqueue("sym::a", "agent-2", "also want to edit", "write").unwrap();
+
+        let queue = db.list_queue().unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].1, "agent-1");
+        assert_eq!(queue[1].1, "agent-2");
+    }
+
+    #[test]
+    fn test_queue_position() {
+        let (_tmp, db) = setup_db();
+        db.enqueue("sym::a", "agent-1", "first", "write").unwrap();
+        db.enqueue("sym::a", "agent-2", "second", "write").unwrap();
+        db.enqueue("sym::a", "agent-3", "third", "write").unwrap();
+
+        assert_eq!(db.queue_position("sym::a", "agent-1").unwrap(), Some(1));
+        assert_eq!(db.queue_position("sym::a", "agent-2").unwrap(), Some(2));
+        assert_eq!(db.queue_position("sym::a", "agent-3").unwrap(), Some(3));
+        assert_eq!(db.queue_position("sym::a", "agent-99").unwrap(), None);
+    }
+
+    #[test]
+    fn test_queue_next_in_queue() {
+        let (_tmp, db) = setup_db();
+        db.enqueue("sym::a", "agent-1", "first", "write").unwrap();
+        db.enqueue("sym::a", "agent-2", "second", "read").unwrap();
+
+        let next = db.next_in_queue("sym::a").unwrap();
+        assert!(next.is_some());
+        let (agent, intent, mode) = next.unwrap();
+        assert_eq!(agent, "agent-1");
+        assert_eq!(intent, "first");
+        assert_eq!(mode, "write");
+    }
+
+    #[test]
+    fn test_queue_dequeue() {
+        let (_tmp, db) = setup_db();
+        db.enqueue("sym::a", "agent-1", "first", "write").unwrap();
+        db.enqueue("sym::a", "agent-2", "second", "write").unwrap();
+
+        db.dequeue("sym::a", "agent-1").unwrap();
+        let queue = db.list_queue().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].1, "agent-2");
+    }
+
+    #[test]
+    fn test_queue_dequeue_all() {
+        let (_tmp, db) = setup_db();
+        db.enqueue("sym::a", "agent-1", "first", "write").unwrap();
+        db.enqueue("sym::b", "agent-1", "second", "write").unwrap();
+        db.enqueue("sym::a", "agent-2", "third", "write").unwrap();
+
+        let count = db.dequeue_all("agent-1").unwrap();
+        assert_eq!(count, 2);
+        let queue = db.list_queue().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].1, "agent-2");
+    }
+
+    // ── Deps tests ──
+
+    #[test]
+    fn test_upsert_and_get_deps() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("a.rs::login", "a.rs", "login", "function"),
+            make_symbol("a.rs::validate", "a.rs", "validate", "function"),
+            make_symbol("a.rs::hash", "a.rs", "hash", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+
+        let deps = vec![
+            Dep { caller: "a.rs::login".into(), callee: "a.rs::validate".into(), kind: "calls".into() },
+            Dep { caller: "a.rs::login".into(), callee: "a.rs::hash".into(), kind: "calls".into() },
+        ];
+        db.upsert_deps(&deps).unwrap();
+
+        let login_deps = db.get_deps("a.rs::login").unwrap();
+        assert_eq!(login_deps.len(), 2);
+    }
+
+    #[test]
+    fn test_transitive_deps() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("a.rs::a", "a.rs", "a", "function"),
+            make_symbol("a.rs::b", "a.rs", "b", "function"),
+            make_symbol("a.rs::c", "a.rs", "c", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+
+        // a -> b -> c
+        let deps = vec![
+            Dep { caller: "a.rs::a".into(), callee: "a.rs::b".into(), kind: "calls".into() },
+            Dep { caller: "a.rs::b".into(), callee: "a.rs::c".into(), kind: "calls".into() },
+        ];
+        db.upsert_deps(&deps).unwrap();
+
+        let transitive = db.get_transitive_deps("a.rs::a").unwrap();
+        assert!(transitive.contains(&"a.rs::b".to_string()));
+        assert!(transitive.contains(&"a.rs::c".to_string()));
+        assert_eq!(transitive.len(), 2);
     }
 }

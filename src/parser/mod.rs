@@ -15,6 +15,13 @@ pub struct Symbol {
     pub hash: String,       // hash of the symbol's source text
 }
 
+#[derive(Debug, Clone)]
+pub struct Dep {
+    pub caller: String,     // symbol id "src/auth.ts::login"
+    pub callee: String,     // symbol id "src/auth.ts::validateToken"
+    pub kind: String,       // "calls"
+}
+
 pub struct SymbolIndex {
     repo_root: PathBuf,
 }
@@ -68,6 +75,149 @@ impl SymbolIndex {
         let repo_root = std::fs::canonicalize(repo_root)
             .with_context(|| format!("Cannot access repo: {}", repo_root))?;
         Ok(Self { repo_root })
+    }
+
+    /// Scan all files for symbols and extract call dependencies
+    pub fn scan_with_deps(&self) -> Result<(Vec<Symbol>, Vec<Dep>)> {
+        let symbols = self.scan_all()?;
+
+        // Build a map: function_name -> [symbol_ids]
+        let mut name_to_ids: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for sym in &symbols {
+            if matches!(sym.kind.as_str(), "function" | "method" | "arrow_fn") {
+                name_to_ids.entry(sym.name.clone()).or_default().push(sym.id.clone());
+            }
+        }
+
+        // Build a map: (file, line_range) -> symbol_id for function bodies
+        let mut file_symbols: std::collections::HashMap<String, Vec<(u32, u32, String)>> = std::collections::HashMap::new();
+        for sym in &symbols {
+            if matches!(sym.kind.as_str(), "function" | "method" | "arrow_fn") {
+                file_symbols.entry(sym.file.clone()).or_default()
+                    .push((sym.start_line, sym.end_line, sym.id.clone()));
+            }
+        }
+
+        let configs = Self::lang_configs();
+        let mut parser = Parser::new();
+        let mut deps = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for config in &configs {
+            if parser.set_language(&config.language).is_err() {
+                continue;
+            }
+
+            for ext in config.extensions {
+                let pattern = format!("{}/**/*.{}", self.repo_root.display(), ext);
+                for entry in glob::glob(&pattern)? {
+                    let path = entry?;
+                    let rel = path.strip_prefix(&self.repo_root).unwrap_or(&path);
+                    let rel_str = rel.to_string_lossy().to_string();
+                    if rel_str.contains("/node_modules/")
+                        || rel_str.contains("/target/")
+                        || rel_str.contains("/.")
+                        || rel_str.contains("/.git/")
+                    {
+                        continue;
+                    }
+
+                    if let Some(fn_ranges) = file_symbols.get(&rel_str) {
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            if let Some(tree) = parser.parse(&source, None) {
+                                let calls = self.extract_calls(&tree.root_node(), &source);
+                                for (call_name, call_line) in &calls {
+                                    // Find which function this call is inside
+                                    let caller = fn_ranges.iter().find(|(start, end, _)| {
+                                        *call_line >= *start && *call_line <= *end
+                                    });
+                                    if let Some((_, _, caller_id)) = caller {
+                                        // Find callee symbol(s) by name
+                                        if let Some(callee_ids) = name_to_ids.get(call_name) {
+                                            for callee_id in callee_ids {
+                                                if callee_id != caller_id {
+                                                    let key = (caller_id.clone(), callee_id.clone());
+                                                    if seen.insert(key) {
+                                                        deps.push(Dep {
+                                                            caller: caller_id.clone(),
+                                                            callee: callee_id.clone(),
+                                                            kind: "calls".to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((symbols, deps))
+    }
+
+    /// Extract function call names and their line numbers from a tree
+    fn extract_calls(&self, node: &tree_sitter::Node, source: &str) -> Vec<(String, u32)> {
+        let mut calls = Vec::new();
+        self.walk_calls(node, source, &mut calls);
+        calls
+    }
+
+    fn walk_calls(&self, node: &tree_sitter::Node, source: &str, out: &mut Vec<(String, u32)>) {
+        let kind = node.kind();
+
+        // Match call expressions across languages
+        // call_expression: JS/TS/Rust/C/C++/Go/Java/C#/PHP/Kotlin
+        // call: Python/Ruby
+        // invocation_expression: C#
+        if kind == "call_expression" || kind == "call" || kind == "invocation_expression" {
+            // Try to extract the function name from the "function" field
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let name = self.resolve_call_name(&func_node, source);
+                if let Some(name) = name {
+                    let line = node.start_position().row as u32 + 1;
+                    out.push((name, line));
+                }
+            }
+            // Also try "name" field (some grammars)
+            if let Some(func_node) = node.child_by_field_name("name") {
+                let name = source[func_node.byte_range()].trim().to_string();
+                if !name.is_empty() {
+                    let line = node.start_position().row as u32 + 1;
+                    out.push((name, line));
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_calls(&child, source, out);
+        }
+    }
+
+    /// Resolve a call expression's function node to a simple name
+    fn resolve_call_name(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
+        match node.kind() {
+            "identifier" | "simple_identifier" => {
+                Some(source[node.byte_range()].trim().to_string())
+            }
+            // method call: obj.method() -> extract "method"
+            "member_expression" | "field_expression" | "navigation_expression" => {
+                node.child_by_field_name("property")
+                    .or_else(|| node.child_by_field_name("field"))
+                    .or_else(|| node.child_by_field_name("name"))
+                    .map(|n| source[n.byte_range()].trim().to_string())
+            }
+            // scoped: mod::func() -> extract "func"
+            "scoped_identifier" | "qualified_identifier" => {
+                node.child_by_field_name("name")
+                    .map(|n| source[n.byte_range()].trim().to_string())
+            }
+            _ => None,
+        }
     }
 
     pub fn scan_all(&self) -> Result<Vec<Symbol>> {
@@ -1045,5 +1195,87 @@ interface Repository {
 
         find_sym(&symbols, "Repository");
         assert_eq!(find_sym(&symbols, "Repository").kind, "interface");
+    }
+
+    // ── 23. Dependency extraction ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_deps_rust() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/auth.rs", r#"
+fn validate_token(token: &str) -> bool {
+    true
+}
+
+fn hash_password(pwd: &str) -> String {
+    pwd.to_string()
+}
+
+fn login(user: &str, pwd: &str) -> bool {
+    let h = hash_password(pwd);
+    validate_token(&h)
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let (symbols, deps) = idx.scan_with_deps().unwrap();
+
+        assert_eq!(symbols.len(), 3);
+
+        // login should call validate_token and hash_password
+        let login_deps: Vec<&str> = deps.iter()
+            .filter(|d| d.caller == "src/auth.rs::login")
+            .map(|d| d.callee.as_str())
+            .collect();
+        assert!(login_deps.contains(&"src/auth.rs::validate_token"), "login should call validate_token, got: {:?}", login_deps);
+        assert!(login_deps.contains(&"src/auth.rs::hash_password"), "login should call hash_password, got: {:?}", login_deps);
+    }
+
+    #[test]
+    fn test_extract_deps_typescript() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/utils.ts", r#"
+function validate(input: string): boolean {
+    return input.length > 0;
+}
+
+function process(data: string): string {
+    if (!validate(data)) {
+        return "";
+    }
+    return data.toUpperCase();
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let (symbols, deps) = idx.scan_with_deps().unwrap();
+
+        assert_eq!(symbols.len(), 2);
+
+        let process_deps: Vec<&str> = deps.iter()
+            .filter(|d| d.caller == "src/utils.ts::process")
+            .map(|d| d.callee.as_str())
+            .collect();
+        assert!(process_deps.contains(&"src/utils.ts::validate"), "process should call validate, got: {:?}", process_deps);
+    }
+
+    #[test]
+    fn test_extract_deps_python() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "app.py", r#"
+def helper():
+    pass
+
+def main():
+    helper()
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let (symbols, deps) = idx.scan_with_deps().unwrap();
+
+        assert_eq!(symbols.len(), 2);
+
+        let main_deps: Vec<&str> = deps.iter()
+            .filter(|d| d.caller == "app.py::main")
+            .map(|d| d.callee.as_str())
+            .collect();
+        assert!(main_deps.contains(&"app.py::helper"), "main should call helper, got: {:?}", main_deps);
     }
 }
