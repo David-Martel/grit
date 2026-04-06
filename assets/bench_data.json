@@ -1,0 +1,248 @@
+{
+  "ts-api": [
+    {
+      "agents": 1,
+      "git_ok": 3,
+      "git_fail": 0,
+      "git_fail_rate": 0.0,
+      "grit_ok": 6,
+      "total_runs": 3
+    },
+    {
+      "agents": 2,
+      "git_ok": 3,
+      "git_fail": 3,
+      "git_fail_rate": 50.0,
+      "grit_ok": 6,
+      "total_runs": 6
+    },
+    {
+      "agents": 5,
+      "git_ok": 3,
+      "git_fail": 12,
+      "git_fail_rate": 80.0,
+      "grit_ok": 6,
+      "total_runs": 15
+    },
+    {
+      "agents": 10,
+      "git_ok": 7,
+      "git_fail": 23,
+      "git_fail_rate": 76.7,
+      "grit_ok": 14,
+      "total_runs": 30
+    },
+    {
+      "agents": 15,
+      "git_ok": 15,
+      "git_fail": 30,
+      "git_fail_rate": 66.7,
+      "grit_ok": 30,
+      "total_runs": 45
+    },
+    {
+      "agents": 20,
+      "git_ok": 15,
+      "git_fail": 45,
+      "git_fail_rate": 75.0,
+      "grit_ok": 30,
+      "total_runs": 60
+    },
+    {
+      "agents": 25,
+      "git_ok": 15,
+      "git_fail": 60,
+      "git_fail_rate": 80.0,
+      "grit_ok": 30,
+      "total_runs": 75
+    },
+    {
+      "agents": 30,
+      "git_ok": 24,
+      "git_fail": 66,
+      "git_fail_rate": 73.3,
+      "grit_ok": 30,
+      "total_runs": 90
+    },
+    {
+      "agents": 40,
+      "git_ok": 54,
+      "git_fail": 66,
+      "git_fail_rate": 55.0,
+      "grit_ok": 30,
+      "total_runs": 120
+    },
+    {
+      "agents": 50,
+      "git_ok": 84,
+      "git_fail": 66,
+      "git_fail_rate": 44.0,
+      "grit_ok": 30,
+      "total_runs": 150
+    }
+  ],
+  "pi-calc": [
+    {
+      "agents": 1,
+      "git_ok": 3,
+      "git_fail": 0,
+      "git_fail_rate": 0.0,
+      "grit_ok": 6,
+      "total_runs": 3
+    },
+    {
+      "agents": 2,
+      "git_ok": 3,
+      "git_fail": 3,
+      "git_fail_rate": 50.0,
+      "grit_ok": 6,
+      "total_runs": 6
+    },
+    {
+      "agents": 5,
+      "git_ok": 3,
+      "git_fail": 12,
+      "git_fail_rate": 80.0,
+      "grit_ok": 6,
+      "total_runs": 15
+    },
+    {
+      "agents": 10,
+      "git_ok": 6,
+      "git_fail": 24,
+      "git_fail_rate": 80.0,
+      "grit_ok": 10,
+      "total_runs": 30
+    },
+    {
+      "agents": 15,
+      "git_ok": 11,
+      "git_fail": 34,
+      "git_fail_rate": 75.6,
+      "grit_ok": 26,
+      "total_runs": 45
+    },
+    {
+      "agents": 20,
+      "git_ok": 12,
+      "git_fail": 48,
+      "git_fail_rate": 80.0,
+      "grit_ok": 22,
+      "total_runs": 60
+    },
+    {
+      "agents": 25,
+      "git_ok": 25,
+      "git_fail": 50,
+      "git_fail_rate": 66.7,
+      "grit_ok": 52,
+      "total_runs": 75
+    },
+    {
+      "agents": 30,
+      "git_ok": 26,
+      "git_fail": 64,
+      "git_fail_rate": 71.1,
+      "grit_ok": 54,
+      "total_runs": 90
+    },
+    {
+      "agents": 40,
+      "git_ok": 26,
+      "git_fail": 94,
+      "git_fail_rate": 78.3,
+      "grit_ok": 54,
+      "total_runs": 120
+    },
+    {
+      "agents": 50,
+      "git_ok": 45,
+      "git_fail": 105,
+      "git_fail_rate": 70.0,
+      "grit_ok": 54,
+      "total_runs": 150
+    }
+  ],
+  "rust-service": [
+    {
+      "agents": 1,
+      "git_ok": 3,
+      "git_fail": 0,
+      "git_fail_rate": 0.0,
+      "grit_ok": 6,
+      "total_runs": 3
+    },
+    {
+      "agents": 2,
+      "git_ok": 3,
+      "git_fail": 3,
+      "git_fail_rate": 50.0,
+      "grit_ok": 6,
+      "total_runs": 6
+    },
+    {
+      "agents": 5,
+      "git_ok": 4,
+      "git_fail": 11,
+      "git_fail_rate": 73.3,
+      "grit_ok": 6,
+      "total_runs": 15
+    },
+    {
+      "agents": 10,
+      "git_ok": 6,
+      "git_fail": 24,
+      "git_fail_rate": 80.0,
+      "grit_ok": 16,
+      "total_runs": 30
+    },
+    {
+      "agents": 15,
+      "git_ok": 14,
+      "git_fail": 31,
+      "git_fail_rate": 68.9,
+      "grit_ok": 28,
+      "total_runs": 45
+    },
+    {
+      "agents": 20,
+      "git_ok": 15,
+      "git_fail": 45,
+      "git_fail_rate": 75.0,
+      "grit_ok": 28,
+      "total_runs": 60
+    },
+    {
+      "agents": 25,
+      "git_ok": 15,
+      "git_fail": 60,
+      "git_fail_rate": 80.0,
+      "grit_ok": 30,
+      "total_runs": 75
+    },
+    {
+      "agents": 30,
+      "git_ok": 30,
+      "git_fail": 60,
+      "git_fail_rate": 66.7,
+      "grit_ok": 30,
+      "total_runs": 90
+    },
+    {
+      "agents": 40,
+      "git_ok": 60,
+      "git_fail": 60,
+      "git_fail_rate": 50.0,
+      "grit_ok": 30,
+      "total_runs": 120
+    },
+    {
+      "agents": 50,
+      "git_ok": 90,
+      "git_fail": 60,
+      "git_fail_rate": 40.0,
+      "grit_ok": 28,
+      "total_runs": 150
+    }
+  ]
+}

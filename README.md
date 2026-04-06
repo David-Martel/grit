@@ -216,32 +216,26 @@ grit config set-s3 --bucket my-bucket --endpoint https://... --region auto
 
 ## Benchmarks
 
-### Feature Throughput (scripts/throughput/)
+<p align="center">
+  <img src="assets/benchmark.png" alt="Benchmark: grit vs git" width="800">
+</p>
 
-Measures what matters: how many features ship vs how many are lost to conflicts.
-
-```
-50 agents, ts-api project:
-
-  RAW GIT                          GRIT
-  ──────                           ────
-  Features delivered:  5/50        Features delivered: 50/50
-  Features LOST:      45           Features LOST:       0
-  Agents conflicted:  45/50        Agents conflicted:   0/50
-  Work wasted:        90%          Work wasted:         0%
-```
-
-### Merge Conflicts (scripts/synthetic/)
-
-Adversarial scenario: all agents edit different functions in the same files.
+Tested across 3 projects (ts-api, pi-calc, rust-service), 1 to 50 agents, 3 rounds each:
 
 ```
-Agents │ Git Failures │ Grit Failures │ Git Conflict Files
-───────┼──────────────┼───────────────┼───────────────────
-    10 │  40/50 (80%) │     0/50 (0%) │              63
-    20 │  82/100(82%) │    0/100 (0%) │              89
-    50 │ 175/250(70%) │    0/250 (0%) │             175
+         RAW GIT                         GRIT
+Agents  Merge Failures  Work Wasted    Merge Failures  Work Wasted
+─────── ──────────────  ───────────    ──────────────  ───────────
+     1       0%             0%              0%             0%
+     2      50%            50%              0%             0%
+     5      80%            80%              0%             0%
+    10      80%            80%              0%             0%
+    20      75%            75%              0%             0%
+    30      73%            73%              0%             0%
+    50      51%            51%              0%             0%
 ```
+
+> With 10 agents: git throws away **80% of all work**. Grit throws away **0%**.
 
 ### Run benchmarks
 
