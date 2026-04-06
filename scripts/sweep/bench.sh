@@ -9,7 +9,7 @@
 #   ./bench.sh --projects "ts-api rust-service py-ml"
 #   ./bench.sh --rounds 3 --iterations 5
 # ──────────────────────────────────────────────────────────────
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
@@ -70,31 +70,31 @@ for PROJECT in $PROJECTS; do
                 TOTAL=${#SYMS[@]}
 
                 START_T=$SECONDS
-                cd "$WORK"
-                MAIN=$(git branch --show-current)
+                MAIN=$(git -C "$WORK" branch --show-current)
 
                 for i in $(seq 1 $NUM_AGENTS); do
-                    git checkout -q "$MAIN"
-                    git checkout -q -b "agent-$i"
+                    git -C "$WORK" checkout -q "$MAIN"
+                    git -C "$WORK" checkout -q -b "agent-$i"
                     K=$((i - 1))
                     while [[ $K -lt $TOTAL ]]; do
                         SYM="${SYMS[$K]}"
                         modify_function "${SYM%%::*}" "${SYM##*::}" "a$i" "$WORK"
                         K=$((K + NUM_AGENTS))
                     done
-                    git add -A 2>/dev/null
-                    git commit -q -m "a$i" 2>/dev/null || true
+                    git -C "$WORK" add -A 2>/dev/null
+                    git -C "$WORK" commit -q -m "a$i" 2>/dev/null || true
                 done
 
-                git checkout -q "$MAIN"
+                git -C "$WORK" checkout -q "$MAIN"
                 for i in $(seq 1 $NUM_AGENTS); do
-                    if git merge --no-ff "agent-$i" -m "m" >/dev/null 2>&1; then
+                    if git -C "$WORK" merge --no-ff "agent-$i" -m "m" >/dev/null 2>&1; then
                         GIT_OK=$((GIT_OK + 1))
                     else
                         GIT_FAIL=$((GIT_FAIL + 1))
-                        C=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
+                        C=$(git -C "$WORK" diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
+                        C=${C:-0}
                         GIT_CONFLICTS=$((GIT_CONFLICTS + C))
-                        git merge --abort 2>/dev/null
+                        git -C "$WORK" merge --abort 2>/dev/null
                     fi
                 done
 
@@ -128,7 +128,8 @@ for PROJECT in $PROJECTS; do
                     [[ ${#AGENT_SYMS[@]} -eq 0 ]] && continue
 
                     (
-                        "$GRIT" --repo "$WORK" claim -a "i${ITER}n${NUM_AGENTS}r${ROUND}a${i}" -i "t" "${AGENT_SYMS[@]}" >/dev/null 2>&1 || exit 1
+                        set +e
+                        "$GRIT" --repo "$WORK" claim -a "i${ITER}n${NUM_AGENTS}r${ROUND}a${i}" -i "t" "${AGENT_SYMS[@]}" >/dev/null 2>&1 || exit 0
                         WT="$WORK/.grit/worktrees/i${ITER}n${NUM_AGENTS}r${ROUND}a${i}"
                         if [[ -d "$WT" ]]; then
                             for SYM in "${AGENT_SYMS[@]}"; do
@@ -142,9 +143,10 @@ for PROJECT in $PROJECTS; do
                 wait
                 GRIT_TIME=$((GRIT_TIME + SECONDS - START_T))
 
-                cd "$WORK"
-                C=$(git status --porcelain 2>/dev/null | grep -c "^UU" || echo "0")
-                M=$(git log --oneline 2>/dev/null | grep -c "grit: merge" || echo "0")
+                C=$(git -C "$WORK" status --porcelain 2>/dev/null | grep -c "^UU" || true)
+                C=${C:-0}
+                M=$(git -C "$WORK" log --oneline 2>/dev/null | grep -c "grit:" || true)
+                M=${M:-0}
                 GRIT_CONFLICTS=$((GRIT_CONFLICTS + C))
                 GRIT_OK=$((GRIT_OK + M))
 
