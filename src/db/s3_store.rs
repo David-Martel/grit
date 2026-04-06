@@ -143,16 +143,20 @@ impl S3LockStore {
 
     /// Conditional PUT — only succeeds if key does NOT exist.
     /// Returns true if created, false if already exists.
+    ///
+    /// Uses If-None-Match on AWS S3, falls back to GET-then-PUT for
+    /// providers that don't support conditional writes (MinIO, GCS, Azure).
     fn put_lock_if_absent(&self, entry: &LockEntry) -> Result<bool> {
         let key = self.lock_key(&entry.symbol_id);
         let body = serde_json::to_vec(entry)?;
 
+        // First try conditional PUT (native S3 / R2)
         let result = self.rt.block_on(async {
             self.client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(&key)
-                .body(ByteStream::from(body))
+                .body(ByteStream::from(body.clone()))
                 .content_type("application/json")
                 .if_none_match("*")
                 .send()
@@ -160,17 +164,36 @@ impl S3LockStore {
         });
 
         match result {
-            Ok(_) => Ok(true),
-            // 412 Precondition Failed = object already exists
+            Ok(_) => return Ok(true),
+            // 412 Precondition Failed = object already exists (AWS S3 / R2)
             Err(SdkError::ServiceError(ref service_err))
                 if service_err.raw().status().as_u16() == 412 =>
             {
-                Ok(false)
+                return Ok(false);
             }
-            Err(err) => {
-                Err(anyhow::anyhow!("S3 conditional PUT failed: {}", err))
-            }
+            // Other error = provider doesn't support If-None-Match (MinIO, GCS, Azure)
+            // Fall through to GET-then-PUT
+            Err(_) => {}
         }
+
+        // Fallback: check if key exists, then PUT if not
+        if self.get_lock(&entry.symbol_id)?.is_some() {
+            return Ok(false);
+        }
+
+        // Key doesn't exist — create it (small race window, acceptable for coordination)
+        self.rt.block_on(async {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(body))
+                .content_type("application/json")
+                .send()
+                .await
+        }).context("S3 PUT failed")?;
+
+        Ok(true)
     }
 
     /// DELETE a lock object
