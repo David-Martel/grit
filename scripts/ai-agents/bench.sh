@@ -10,7 +10,7 @@
 #   ./bench.sh --agents 30 --provider claude --project rust-service
 #   ./bench.sh --sweep                  # run 10,20,30,50 agents
 # ──────────────────────────────────────────────────────────────
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
@@ -180,17 +180,20 @@ IMPORTANT:
     done
 
     local LOCKS_REMAINING
-    LOCKS_REMAINING=$("$GRIT" --repo "$WORK" status 2>/dev/null | grep -c ">" || echo "0")
+    LOCKS_REMAINING=$("$GRIT" --repo "$WORK" status 2>/dev/null | grep -c ">" || true)
+    LOCKS_REMAINING=${LOCKS_REMAINING:-0}
 
-    cd "$WORK"
     local CONFLICT_COUNT
-    CONFLICT_COUNT=$(git status --porcelain 2>/dev/null | grep -c "^UU" || echo "0")
+    CONFLICT_COUNT=$(git -C "$WORK" status --porcelain 2>/dev/null | grep -c "^UU" || true)
+    CONFLICT_COUNT=${CONFLICT_COUNT:-0}
     local MERGE_COUNT
-    MERGE_COUNT=$(git log --oneline 2>/dev/null | grep -c "grit: merge" || echo "0")
+    MERGE_COUNT=$(git -C "$WORK" log --oneline 2>/dev/null | grep -c "grit:" || true)
+    MERGE_COUNT=${MERGE_COUNT:-0}
 
     # Check queue
     local QUEUE_COUNT
-    QUEUE_COUNT=$("$GRIT" --repo "$WORK" queue list 2>/dev/null | grep -c ">" || echo "0")
+    QUEUE_COUNT=$("$GRIT" --repo "$WORK" queue list 2>/dev/null | grep -c ">" || true)
+    QUEUE_COUNT=${QUEUE_COUNT:-0}
 
     # ── Print results ──
     print_header "RESULTS: $N x $PROVIDER on $PROJECT"
