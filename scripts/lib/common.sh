@@ -86,6 +86,14 @@ modify_function() {
     fi
 }
 
+# Add a header comment to a file (forces merge conflicts when multiple agents touch same file)
+add_file_header() {
+    local FILE="$1" TAG="$2" DIR="$3"
+    local FILEPATH="$DIR/$FILE"
+    [[ -f "$FILEPATH" ]] || return 0
+    sed -i '' "1s/^/\/\/ ${TAG} $(date +%s%N)\n/" "$FILEPATH" 2>/dev/null
+}
+
 # Print a results table header
 print_header() {
     local title="$1"

@@ -73,11 +73,24 @@ for ROUND in $(seq 1 $NUM_ROUNDS); do
         git -C "$WORK" checkout -q "$MAIN_BRANCH"
         git -C "$WORK" checkout -q -b "agent-$i"
 
+        # Round-robin: agent i gets symbols i, i+N, i+2N, ...
+        MODIFIED_FILES=()
         K=$((i - 1))
         while [[ $K -lt $TOTAL ]]; do
             SYM="${SYMS[$K]}"
-            modify_function "${SYM%%::*}" "${SYM##*::}" "agent-$i-r$ROUND" "$WORK"
+            FILE="${SYM%%::*}"
+            modify_function "$FILE" "${SYM##*::}" "agent-$i-r$ROUND" "$WORK"
+            # Track files for header insertion
+            if [[ ! " ${MODIFIED_FILES[*]:-} " =~ " $FILE " ]]; then
+                MODIFIED_FILES+=("$FILE")
+            fi
             K=$((K + NUM_AGENTS))
+        done
+
+        # Add a header to each modified file — this GUARANTEES conflicts
+        # because multiple agents prepend to the same file from the same base
+        for FILE in "${MODIFIED_FILES[@]:-}"; do
+            [[ -n "$FILE" ]] && add_file_header "$FILE" "AGENT-$i-R$ROUND" "$WORK"
         done
 
         git -C "$WORK" add -A 2>/dev/null
