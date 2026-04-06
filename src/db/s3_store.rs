@@ -172,28 +172,28 @@ impl S3LockStore {
                 return Ok(false);
             }
             // Other error = provider doesn't support If-None-Match (MinIO, GCS, Azure)
-            // Fall through to GET-then-PUT
+            // Fall through to check-existing approach
             Err(_) => {}
         }
 
-        // Fallback: check if key exists, then PUT if not
-        if self.get_lock(&entry.symbol_id)?.is_some() {
-            return Ok(false);
+        // Fallback for providers without conditional PUT (MinIO, GCS):
+        // Use optimistic locking: write our lock, then re-read to verify ownership.
+        // If another agent also wrote, last-writer-wins — the loser detects on re-read.
+        self.put_lock(entry)?;
+
+        // Brief pause to let the write propagate (GCS is strongly consistent since 2021,
+        // but MinIO clusters may have replication lag)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Re-read to verify we own the lock
+        match self.get_lock(&entry.symbol_id)? {
+            Some(stored) if stored.agent_id == entry.agent_id => Ok(true),
+            Some(_) => {
+                // Another agent overwrote our lock — we lost
+                Ok(false)
+            }
+            None => Ok(true), // Lock vanished, treat as success
         }
-
-        // Key doesn't exist — create it (small race window, acceptable for coordination)
-        self.rt.block_on(async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(ByteStream::from(body))
-                .content_type("application/json")
-                .send()
-                .await
-        }).context("S3 PUT failed")?;
-
-        Ok(true)
     }
 
     /// DELETE a lock object
