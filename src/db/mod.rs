@@ -10,7 +10,10 @@ use crate::parser::{Symbol, Dep};
 
 /// Apply standard PRAGMA settings to a new SQLite connection.
 pub fn configure_connection(conn: &Connection) -> Result<()> {
-    match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;") {
+    // foreign_keys is enforced at runtime (the bundled SQLite defaults it on),
+    // but set it explicitly so the locks/deps -> symbols references stay
+    // enforced regardless of how SQLite was built.
+    match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;") {
         Ok(_) => Ok(()),
         Err(e) => {
             let err_str = e.to_string();
@@ -122,10 +125,22 @@ impl Database {
             "
         )?;
 
-        // Try to add ttl_seconds column if it doesn't exist (migration for existing DBs)
-        let _ = self.conn.execute_batch(
-            "ALTER TABLE locks ADD COLUMN ttl_seconds INTEGER DEFAULT 600;"
-        );
+        // Migrate pre-ttl databases: add ttl_seconds only when it is actually
+        // missing. Fresh DBs already have the column from CREATE TABLE, so the
+        // old unconditional ALTER always failed and its error was swallowed —
+        // detect the column and surface any real migration error instead.
+        let has_ttl = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(locks)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            cols.iter().any(|c| c == "ttl_seconds")
+        };
+        if !has_ttl {
+            self.conn.execute_batch(
+                "ALTER TABLE locks ADD COLUMN ttl_seconds INTEGER DEFAULT 600;"
+            )?;
+        }
 
         Ok(())
     }
@@ -154,9 +169,12 @@ impl Database {
             return Ok(Vec::new());
         }
         let placeholders: Vec<String> = files.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        // Join only NON-expired locks, so a symbol whose only lock has expired
+        // is still reported available (an expired lock no longer occupies it).
         let sql = format!(
             "SELECT s.id FROM symbols s
              LEFT JOIN locks l ON s.id = l.symbol_id
+               AND (julianday('now') - julianday(l.locked_at)) * 86400 <= COALESCE(l.ttl_seconds, 600)
              WHERE s.file IN ({}) AND l.symbol_id IS NULL
              ORDER BY s.id",
             placeholders.join(", ")
@@ -314,8 +332,12 @@ impl Database {
     // ── Queue management ──
 
     pub fn enqueue(&self, symbol_id: &str, agent_id: &str, intent: &str, mode: &str) -> Result<()> {
+        // Use ON CONFLICT (not INSERT OR REPLACE): re-enqueuing the same agent
+        // must keep its original queued_at and rowid so it does not lose its
+        // FIFO position by going to the back of the line.
         self.conn.execute(
-            "INSERT OR REPLACE INTO lock_queue (symbol_id, agent_id, intent, mode) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO lock_queue (symbol_id, agent_id, intent, mode) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(symbol_id, agent_id) DO UPDATE SET intent = excluded.intent, mode = excluded.mode",
             params![symbol_id, agent_id, intent, mode],
         )?;
         Ok(())
@@ -339,9 +361,11 @@ impl Database {
 
     /// Next agent in queue for a symbol (FIFO by queued_at)
     pub fn next_in_queue(&self, symbol_id: &str) -> Result<Option<(String, String, String)>> {
+        // rowid (monotonic insertion order) breaks queued_at ties, which are
+        // common since queued_at has only second resolution.
         let result = self.conn.query_row(
             "SELECT agent_id, intent, COALESCE(mode, 'write') FROM lock_queue
-             WHERE symbol_id = ?1 ORDER BY queued_at ASC LIMIT 1",
+             WHERE symbol_id = ?1 ORDER BY queued_at ASC, rowid ASC LIMIT 1",
             params![symbol_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         );
@@ -355,7 +379,7 @@ impl Database {
     /// Queue position for an agent on a symbol (1-based, None if not queued)
     pub fn queue_position(&self, symbol_id: &str, agent_id: &str) -> Result<Option<usize>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id FROM lock_queue WHERE symbol_id = ?1 ORDER BY queued_at ASC"
+            "SELECT agent_id FROM lock_queue WHERE symbol_id = ?1 ORDER BY queued_at ASC, rowid ASC"
         )?;
         let agents: Vec<String> = stmt.query_map(params![symbol_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -366,7 +390,7 @@ impl Database {
     pub fn list_queue(&self) -> Result<Vec<(String, String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol_id, agent_id, intent, COALESCE(mode, 'write'), queued_at
-             FROM lock_queue ORDER BY symbol_id, queued_at ASC"
+             FROM lock_queue ORDER BY symbol_id, queued_at ASC, rowid ASC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
@@ -655,5 +679,51 @@ mod tests {
         assert!(transitive.contains(&"a.rs::b".to_string()));
         assert!(transitive.contains(&"a.rs::c".to_string()));
         assert_eq!(transitive.len(), 2);
+    }
+
+    #[test]
+    fn test_enqueue_preserves_position_on_requeue() {
+        let (_tmp, db) = setup_db();
+        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")]).unwrap();
+
+        db.enqueue("f.rs::x", "agent-1", "first", "write").unwrap();
+        db.enqueue("f.rs::x", "agent-2", "second", "write").unwrap();
+        assert_eq!(db.queue_position("f.rs::x", "agent-1").unwrap(), Some(1));
+        assert_eq!(db.queue_position("f.rs::x", "agent-2").unwrap(), Some(2));
+
+        // Re-enqueuing agent-1 (e.g. retry) must NOT send it to the back.
+        db.enqueue("f.rs::x", "agent-1", "first-again", "write").unwrap();
+        assert_eq!(db.queue_position("f.rs::x", "agent-1").unwrap(), Some(1));
+        assert_eq!(db.queue_position("f.rs::x", "agent-2").unwrap(), Some(2));
+
+        // The head is still agent-1, with its intent updated.
+        let (head, intent, _mode) = db.next_in_queue("f.rs::x").unwrap().unwrap();
+        assert_eq!(head, "agent-1");
+        assert_eq!(intent, "first-again");
+    }
+
+    #[test]
+    fn test_availability_ignores_expired_locks() {
+        let (_tmp, db) = setup_db();
+        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")]).unwrap();
+
+        // An expired lock (ttl 1s, locked_at well in the past) must not make the
+        // symbol look unavailable.
+        db.conn.execute(
+            "INSERT INTO locks (symbol_id, agent_id, intent, mode, locked_at, ttl_seconds)
+             VALUES ('f.rs::x', 'ghost', 'stale', 'write', datetime('now','-1 hour'), 1)",
+            [],
+        ).unwrap();
+
+        let avail = db.available_symbols_in_files(&["f.rs"]).unwrap();
+        assert!(avail.contains(&"f.rs::x".to_string()), "expired lock should free the symbol");
+
+        // A fresh lock keeps it unavailable.
+        db.conn.execute(
+            "UPDATE locks SET locked_at = datetime('now'), ttl_seconds = 600 WHERE symbol_id = 'f.rs::x'",
+            [],
+        ).unwrap();
+        let avail2 = db.available_symbols_in_files(&["f.rs"]).unwrap();
+        assert!(!avail2.contains(&"f.rs::x".to_string()), "fresh lock should occupy the symbol");
     }
 }

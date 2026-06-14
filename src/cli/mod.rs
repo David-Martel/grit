@@ -411,6 +411,9 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
     if mode != "read" && mode != "write" {
         anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
     }
+    if symbols.is_empty() {
+        anyhow::bail!("No symbols specified to claim (e.g. `grit claim -a <agent> -i <intent> file.rs::symbol`)");
+    }
 
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
@@ -594,7 +597,17 @@ fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
 fn promote_queued(db: &Database, lock_store: &dyn LockStore, symbols: &[String], grit_dir: &std::path::Path) -> Result<()> {
     let room = Room::new(grit_dir);
     for sym_id in symbols {
-        if let Some((next_agent, next_intent, next_mode)) = db.next_in_queue(sym_id)? {
+        // Drain the queue head for this symbol. A granted WRITE lock is
+        // exclusive, so stop after it. A granted READ lock is shared, so keep
+        // draining consecutive queued readers until the head is a writer (which
+        // will block on the readers we just granted) or the queue empties.
+        // TODO(#queue-ttl-worktree): promotion uses a hardcoded 600s TTL and
+        // does not create the promoted agent's worktree — both require storing
+        // the request TTL in lock_queue and threading GitRepo here.
+        loop {
+            let Some((next_agent, next_intent, next_mode)) = db.next_in_queue(sym_id)? else {
+                break;
+            };
             match lock_store.try_lock(sym_id, &next_agent, &next_intent, 600, &next_mode)? {
                 LockResult::Granted => {
                     db.dequeue(sym_id, &next_agent)?;
@@ -604,9 +617,15 @@ fn promote_queued(db: &Database, lock_store: &dyn LockStore, symbols: &[String],
                         agent: next_agent,
                         symbols: vec![sym_id.clone()],
                     });
+                    // Only keep draining if this was a shared read lock.
+                    if next_mode != "read" {
+                        break;
+                    }
                 }
                 LockResult::Blocked { .. } => {
-                    // Still blocked (e.g., another lock mode conflict), leave in queue
+                    // Head can't be granted yet (e.g. a writer behind readers),
+                    // leave it and the rest of the queue in place.
+                    break;
                 }
             }
         }

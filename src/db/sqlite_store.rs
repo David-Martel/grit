@@ -56,10 +56,12 @@ impl LockStore for SqliteLockStore {
         // observes our lock.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Clean up expired locks on this symbol
+        // Clean up expired locks on this symbol. COALESCE matches
+        // gc_expired_locks so legacy rows with a NULL ttl_seconds are still
+        // collectable here instead of lingering forever.
         tx.execute(
             "DELETE FROM locks WHERE symbol_id = ?1
-             AND (julianday('now') - julianday(locked_at)) * 86400 > ttl_seconds",
+             AND (julianday('now') - julianday(locked_at)) * 86400 > COALESCE(ttl_seconds, 600)",
             params![symbol_id],
         )?;
 

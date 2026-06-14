@@ -28,27 +28,36 @@ impl GitRepo {
 
         std::fs::create_dir_all(wt_path.parent().unwrap())?;
 
-        // Create a new branch and worktree
-        let output = Command::new("git")
-            .args(["worktree", "add", "-b", &branch_name, "--", &wt_path.to_string_lossy()])
+        // Decide create-vs-reuse from a real ref existence check rather than
+        // parsing localized "already exists" stderr. If the agent branch
+        // survived a previous run, reuse it but warn loudly — the worktree will
+        // resume on top of whatever commits that branch already carries.
+        let branch_exists = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch_name)])
             .current_dir(&self.root)
             .output()
-            .context("Failed to run git worktree add")?;
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let output = if branch_exists {
+            eprintln!(
+                "  warn: branch {} already exists from a previous run; reusing it for agent {}",
+                branch_name, agent_id
+            );
+            Command::new("git")
+                .args(["worktree", "add", "--", &wt_path.to_string_lossy(), &branch_name])
+                .current_dir(&self.root)
+                .output()
+        } else {
+            Command::new("git")
+                .args(["worktree", "add", "-b", &branch_name, "--", &wt_path.to_string_lossy()])
+                .current_dir(&self.root)
+                .output()
+        }
+        .context("Failed to run git worktree add")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // If branch already exists, try without -b
-            if stderr.contains("already exists") {
-                let output2 = Command::new("git")
-                    .args(["worktree", "add", "--", &wt_path.to_string_lossy(), &branch_name])
-                    .current_dir(&self.root)
-                    .output()?;
-                if !output2.status.success() {
-                    anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&output2.stderr));
-                }
-            } else {
-                anyhow::bail!("git worktree add failed: {}", stderr);
-            }
+            anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
         }
 
         Ok(wt_path)
@@ -185,8 +194,15 @@ impl GitRepo {
             .output()?;
 
         if !rebase_output.status.success() {
-            // Rebase failed (likely a conflict) — abort and fall back to a plain
-            // merge, which surfaces the conflict explicitly below.
+            // Rebase failed (likely a conflict) — warn (so the operator knows
+            // the branch was not cleanly rebased), abort, and fall back to a
+            // plain merge, which surfaces the conflict explicitly below.
+            eprintln!(
+                "  warn: rebase of agent/{} onto {} failed; falling back to a direct merge: {}",
+                agent_id,
+                current,
+                String::from_utf8_lossy(&rebase_output.stderr).trim()
+            );
             let _ = Command::new("git")
                 .args(["rebase", "--abort"])
                 .current_dir(&wt_path)
@@ -202,12 +218,22 @@ impl GitRepo {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Abort any failed merge state
-            let _ = Command::new("git")
+            // Abort any failed merge state. If the abort itself fails, the main
+            // worktree may be left mid-merge — surface that in the error so the
+            // operator knows manual `git merge --abort` may be needed.
+            let abort = Command::new("git")
                 .args(["merge", "--abort"])
                 .current_dir(&self.root)
                 .output();
-            anyhow::bail!("git merge failed: {}", stderr);
+            let abort_note = match abort {
+                Ok(o) if o.status.success() => String::new(),
+                Ok(o) => format!(
+                    " (warning: `git merge --abort` also failed: {}; the main worktree may be mid-merge)",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => format!(" (warning: could not run `git merge --abort`: {e}; the main worktree may be mid-merge)"),
+            };
+            anyhow::bail!("git merge failed: {}{}", stderr, abort_note);
         }
 
         Ok(())
@@ -358,11 +384,21 @@ impl GitRepo {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("already exists") {
-                // PR already exists, get URL
+                // PR already exists — resolve its URL. Pass the branch
+                // explicitly (without it `gh pr view` resolves against the
+                // current branch, which may not be this one) and check the
+                // command actually succeeded before trusting stdout.
                 let view = Command::new("gh")
-                    .args(["pr", "view", "--json", "url", "-q", ".url"])
+                    .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
                     .current_dir(&self.root)
                     .output()?;
+                if !view.status.success() {
+                    anyhow::bail!(
+                        "PR already exists for {} but `gh pr view` failed: {}",
+                        branch,
+                        String::from_utf8_lossy(&view.stderr)
+                    );
+                }
                 return Ok(String::from_utf8_lossy(&view.stdout).trim().to_string());
             }
             anyhow::bail!("gh pr create failed: {}", stderr);
