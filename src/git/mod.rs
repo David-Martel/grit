@@ -226,24 +226,35 @@ impl GitRepo {
                     return Ok(FileLock { path: path.to_path_buf() });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Check if the lock is stale:
-                    // 1. If the PID in the file is no longer alive, it's stale
-                    // 2. Fallback: if older than 30s, assume stale
+                    // Decide whether the existing lock is stale. Prefer a
+                    // definitive liveness check on the recorded PID; only fall
+                    // back to a time heuristic when liveness cannot be
+                    // determined. A live holder is NEVER treated as stale,
+                    // regardless of how long it has held the lock — a large
+                    // merge can legitimately run for minutes, and stealing its
+                    // lock would let two `git merge` operations run concurrently
+                    // against the same worktree.
                     let mut is_stale = false;
+                    let mut liveness_known = false;
                     if let Ok(contents) = fs::read_to_string(path) {
                         if let Ok(pid) = contents.trim().parse::<u32>() {
                             // Check if process is alive (kill with signal 0)
                             use std::process::Command as Cmd;
                             if let Ok(output) = Cmd::new("kill").args(["-0", &pid.to_string()]).output() {
+                                liveness_known = true;
                                 if !output.status.success() {
-                                    // Process is dead -- lock is stale
+                                    // Process is dead -- lock is stale.
                                     is_stale = true;
                                 }
+                                // Process is alive -- hold off and keep waiting.
                             }
                         }
                     }
-                    if !is_stale {
-                        // Fallback: time-based staleness
+                    if !liveness_known {
+                        // Could not determine the holder's liveness (unreadable
+                        // PID, or `kill` unavailable). Fall back to a time-based
+                        // heuristic so a crashed holder cannot wedge the lock
+                        // forever.
                         if let Ok(meta) = fs::metadata(path) {
                             if let Ok(modified) = meta.modified() {
                                 if modified.elapsed().unwrap_or_default().as_secs() > 30 {
@@ -284,26 +295,37 @@ impl GitRepo {
     pub fn create_session_branch(&self, session_name: &str) -> Result<String> {
         let branch_name = format!("grit/{}", session_name);
 
-        let output = Command::new("git")
-            .args(["checkout", "-b", "--", &branch_name])
+        // Decide create-vs-switch from a real existence check rather than from
+        // parsing stderr: git localizes its messages, so matching on
+        // "already exists" silently breaks under non-English locales. The
+        // branch name is `grit/<validated-name>` and can never start with `-`,
+        // so option injection is not a concern (and no `--` separator is used:
+        // `git checkout -b -- <branch>` misparses `<branch>` as a start-point).
+        let exists = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch_name)])
             .current_dir(&self.root)
             .output()
-            .context("Failed to create session branch")?;
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let checkout_args: &[&str] = if exists {
+            &["checkout", &branch_name]
+        } else {
+            &["checkout", "-b", &branch_name]
+        };
+
+        let output = Command::new("git")
+            .args(checkout_args)
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to create or switch to session branch")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("already exists") {
-                // Switch to existing branch
-                let output2 = Command::new("git")
-                    .args(["checkout", "--", &branch_name])
-                    .current_dir(&self.root)
-                    .output()?;
-                if !output2.status.success() {
-                    anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output2.stderr));
-                }
-            } else {
-                anyhow::bail!("git checkout -b failed: {}", stderr);
-            }
+            anyhow::bail!(
+                "git checkout for session branch '{}' failed: {}",
+                branch_name,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(branch_name)

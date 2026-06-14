@@ -42,68 +42,80 @@ impl SqliteLockStore {
 
 impl LockStore for SqliteLockStore {
     fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+
+        // The whole check-then-set MUST be atomic across processes. Each `grit`
+        // invocation is a separate process with its own connection, so the
+        // struct Mutex only serializes threads within one process. Without a
+        // transaction that takes the write lock up front, two processes could
+        // both read "no conflicting lock" and both INSERT a write lock on the
+        // same symbol (distinct (symbol_id, agent_id) primary keys, so neither
+        // INSERT fails) — granting two agents a write lock on the same symbol.
+        // BEGIN IMMEDIATE acquires the database write lock before the SELECT, so
+        // a concurrent process blocks (busy_timeout) until we commit and then
+        // observes our lock.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Clean up expired locks on this symbol
-        conn.execute(
+        tx.execute(
             "DELETE FROM locks WHERE symbol_id = ?1
              AND (julianday('now') - julianday(locked_at)) * 86400 > ttl_seconds",
             params![symbol_id],
         )?;
 
         // Check existing locks on this symbol (there can be multiple read locks)
-        let mut stmt = conn.prepare(
-            "SELECT agent_id, intent, COALESCE(mode, 'write') FROM locks WHERE symbol_id = ?1"
-        )?;
-        let existing: Vec<(String, String, String)> = stmt.query_map(params![symbol_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?.collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+        let existing: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT agent_id, intent, COALESCE(mode, 'write') FROM locks WHERE symbol_id = ?1"
+            )?;
+            let rows = stmt.query_map(params![symbol_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?.collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
 
-        if existing.is_empty() {
-            conn.execute(
+        let result = if existing.is_empty() {
+            tx.execute(
                 "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![symbol_id, agent_id, intent, mode, ttl_seconds],
             )
             .map_err(|e| unknown_symbol_error(symbol_id, e))?;
-            return Ok(LockResult::Granted);
-        }
-
-        // Same agent already holds a lock on this symbol -- update it
-        if existing.iter().any(|(a, _, _)| a == agent_id) {
-            conn.execute(
+            LockResult::Granted
+        } else if existing.iter().any(|(a, _, _)| a == agent_id) {
+            // Same agent already holds a lock on this symbol -- update it
+            tx.execute(
                 "UPDATE locks SET intent = ?1, mode = ?2, locked_at = datetime('now'), ttl_seconds = ?5
                  WHERE symbol_id = ?3 AND agent_id = ?4",
                 params![intent, mode, symbol_id, agent_id, ttl_seconds],
             )?;
-            return Ok(LockResult::Granted);
-        }
-
-        // Different agent(s) hold locks -- apply read/write compatibility:
-        //   write request: blocked by ANY other agent's lock
-        //   read request: blocked only by a WRITE lock from another agent
-        if mode == "read" {
+            LockResult::Granted
+        } else if mode == "read" {
+            // Read request: blocked only by a WRITE lock from another agent.
             if let Some((by_agent, by_intent, _)) = existing.iter().find(|(_, _, m)| m == "write") {
-                return Ok(LockResult::Blocked {
+                LockResult::Blocked {
                     by_agent: by_agent.clone(),
                     by_intent: by_intent.clone(),
-                });
+                }
+            } else {
+                // All existing locks are read -- grant (insert new read lock row)
+                tx.execute(
+                    "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![symbol_id, agent_id, intent, mode, ttl_seconds],
+                )
+                .map_err(|e| unknown_symbol_error(symbol_id, e))?;
+                LockResult::Granted
             }
-            // All existing locks are read -- grant (insert new read lock row)
-            conn.execute(
-                "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![symbol_id, agent_id, intent, mode, ttl_seconds],
-            )
-            .map_err(|e| unknown_symbol_error(symbol_id, e))?;
-            return Ok(LockResult::Granted);
-        }
+        } else {
+            // Write lock requested -- blocked by any other agent's lock.
+            let (by_agent, by_intent, _) = &existing[0];
+            LockResult::Blocked {
+                by_agent: by_agent.clone(),
+                by_intent: by_intent.clone(),
+            }
+        };
 
-        // Write lock requested -- blocked by any other agent's lock
-        let (by_agent, by_intent, _) = &existing[0];
-        Ok(LockResult::Blocked {
-            by_agent: by_agent.clone(),
-            by_intent: by_intent.clone(),
-        })
+        tx.commit()?;
+        Ok(result)
     }
 
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
@@ -363,6 +375,65 @@ mod tests {
 
         assert_eq!(granted, 1, "expected exactly 1 Granted, got {}", granted);
         assert_eq!(blocked, 9, "expected exactly 9 Blocked, got {}", blocked);
+    }
+
+    /// Regression test for the cross-process double-write-lock race: each thread
+    /// opens its OWN `SqliteLockStore` (a separate connection, exactly like a
+    /// separate `grit` process), so the per-store Mutex provides no mutual
+    /// exclusion between them. Only the `BEGIN IMMEDIATE` transaction in
+    /// try_lock keeps the check-then-set atomic. Without it, several agents
+    /// would each be Granted a write lock on the same symbol.
+    #[test]
+    fn test_concurrent_access_separate_connections() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("race.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA busy_timeout=5000;
+                 CREATE TABLE IF NOT EXISTS locks (
+                     symbol_id   TEXT NOT NULL,
+                     agent_id    TEXT NOT NULL,
+                     intent      TEXT,
+                     mode        TEXT DEFAULT 'write',
+                     locked_at   TEXT DEFAULT (datetime('now')),
+                     ttl_seconds INTEGER DEFAULT 600,
+                     PRIMARY KEY (symbol_id, agent_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_locks_agent ON locks(agent_id);",
+            )
+            .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = SqliteLockStore::open(&path).expect("open");
+                let agent = format!("agent-{}", i);
+                store.try_lock("sym::contested", &agent, "racing", 600, "write").unwrap()
+            }));
+        }
+
+        let results: Vec<LockResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let granted = results.iter().filter(|r| matches!(r, LockResult::Granted)).count();
+
+        assert_eq!(
+            granted, 1,
+            "exactly one agent must win the write lock across separate connections, got {}",
+            granted
+        );
+
+        // And the database must agree: a single write lock row for the symbol.
+        let store = SqliteLockStore::open(&db_path).unwrap();
+        let rows: Vec<_> = store
+            .all_locks()
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.symbol_id == "sym::contested")
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one lock row expected, got {}", rows.len());
     }
 
     // ── Read/write lock mode tests ──
