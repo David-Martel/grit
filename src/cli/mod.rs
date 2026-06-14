@@ -765,33 +765,45 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     // to prevent orphan locks when the process crashes mid-operation.
     let git_repo = GitRepo::open(repo)?;
     let mut merge_error: Option<String> = None;
+    let mut merged = false;
 
     // Try to merge worktree back
     match git_repo.merge_worktree(agent) {
         Ok(()) => {
             println!("{} Merged branch agent/{}", "+".green(), agent);
+            merged = true;
         }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not found") || msg.contains("does not exist") {
-                // No worktree, that's fine
+                // No worktree to merge — nothing to clean up either.
             } else {
                 merge_error = Some(msg);
             }
         }
     }
 
-    // Clean up worktree
-    match git_repo.remove_worktree(agent) {
-        Ok(()) => {
-            println!("{} Removed worktree for {}", "+".green(), agent);
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("not found") && !msg.contains("does not exist") {
-                eprintln!("  warn: could not remove worktree: {}", e);
+    // Only tear down the worktree and delete the agent branch once the merge
+    // succeeded. If the merge was skipped or failed, keep both so the agent's
+    // commit stays reachable and recoverable (issue #21).
+    if merged {
+        match git_repo.remove_worktree(agent) {
+            Ok(()) => {
+                println!("{} Removed worktree for {}", "+".green(), agent);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("does not exist") {
+                    eprintln!("  warn: could not remove worktree: {}", e);
+                }
             }
         }
+        let _ = git_repo.delete_agent_branch(agent);
+    } else if merge_error.is_some() {
+        eprintln!(
+            "  warn: merge skipped — keeping worktree .grit/worktrees/{} and branch agent/{} for recovery",
+            agent, agent
+        );
     }
 
     // Release locks regardless of merge outcome

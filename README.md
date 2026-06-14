@@ -267,6 +267,23 @@ grit config set-s3 --bucket <name> --endpoint <url> --region <r>          # S3/R
 └──────────────────────────────────────────┘
 ```
 
+## Troubleshooting
+
+**`grit done` reports "main worktree has uncommitted changes"** — the merge is
+skipped on purpose to avoid corrupting the repo. Commit or stash the changes in
+your main checkout, then run `grit done` again. The agent branch `agent/<name>`
+is kept intact, so no work is lost.
+
+**`grit claim` says a symbol "is not in the registry"** — the symbol was never
+indexed. Run `grit symbols` to list indexed symbols, or re-run `grit init` if
+the codebase changed since the last scan.
+
+**Relative-path dependencies break inside `.grit/worktrees/`** — a worktree
+lives a few directories below the repo root, so a Cargo/npm dependency declared
+with a relative path (e.g. `path = "../sibling"`) resolves to the wrong place.
+Symlink the dependency next to the `worktrees` directory, or use an absolute
+path in the manifest.
+
 ## Benchmarks
 
 <p align="center">

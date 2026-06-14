@@ -5,6 +5,23 @@ use std::sync::Mutex;
 
 use super::lock_store::{LockEntry, LockResult, LockStore};
 
+/// Translate a raw SQLite foreign-key failure on `locks.symbol_id` into an
+/// actionable message. The lock table references `symbols(id)`, so claiming a
+/// symbol that was never indexed surfaces as a bare "FOREIGN KEY constraint
+/// failed" otherwise (issue #21).
+fn unknown_symbol_error(symbol_id: &str, err: rusqlite::Error) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(e, _) = &err {
+        if e.code == rusqlite::ErrorCode::ConstraintViolation {
+            return anyhow::anyhow!(
+                "symbol '{}' is not in the registry. Run `grit symbols` to list \
+                 indexed symbols (re-run `grit init` if the codebase changed).",
+                symbol_id
+            );
+        }
+    }
+    err.into()
+}
+
 /// SQLite-backed lock store (local coordination)
 pub struct SqliteLockStore {
     conn: Mutex<Connection>,
@@ -47,7 +64,8 @@ impl LockStore for SqliteLockStore {
             conn.execute(
                 "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![symbol_id, agent_id, intent, mode, ttl_seconds],
-            )?;
+            )
+            .map_err(|e| unknown_symbol_error(symbol_id, e))?;
             return Ok(LockResult::Granted);
         }
 
@@ -75,7 +93,8 @@ impl LockStore for SqliteLockStore {
             conn.execute(
                 "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![symbol_id, agent_id, intent, mode, ttl_seconds],
-            )?;
+            )
+            .map_err(|e| unknown_symbol_error(symbol_id, e))?;
             return Ok(LockResult::Granted);
         }
 
