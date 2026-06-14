@@ -132,6 +132,24 @@ impl S3LockStore {
         Ok(())
     }
 
+    /// GET and parse the object at an explicit key, None if absent.
+    fn get_at(&self, key: &str) -> Result<Option<LockEntry>> {
+        let result = self.rt.block_on(async {
+            self.client.get_object().bucket(&self.bucket).key(key).send().await
+        });
+        match result {
+            Ok(output) => {
+                let body = self.rt.block_on(async {
+                    output.body.collect().await.map(|b| b.to_vec())
+                })?;
+                Ok(Some(self.parse_entry(&body)?))
+            }
+            Err(SdkError::ServiceError(ref e)) if e.err().is_no_such_key() => Ok(None),
+            Err(SdkError::ServiceError(ref e)) if e.raw().status().as_u16() == 404 => Ok(None),
+            Err(err) => Err(anyhow::anyhow!("S3 GET failed: {}", err)),
+        }
+    }
+
     /// List the non-expired READ locks held on `symbol_id` by other agents.
     fn other_active_readers(&self, symbol_id: &str, agent_id: &str) -> Result<Vec<LockEntry>> {
         let prefix = format!("{}r/{}/", self.prefix, urlencoding::encode(symbol_id));
@@ -556,17 +574,29 @@ impl LockStore for S3LockStore {
         let mut count = 0;
         for entry in all {
             if entry.agent_id == agent_id {
-                let updated = LockEntry {
-                    symbol_id: entry.symbol_id,
-                    agent_id: entry.agent_id,
-                    intent: entry.intent,
-                    locked_at: now.clone(),
-                    ttl_seconds,
-                    mode: entry.mode,
-                };
-                // Refresh at the entry's real key (reader keyspace for reads).
-                self.put_at(&self.key_for_entry(&updated), &updated)?;
-                count += 1;
+                let key = self.key_for_entry(&entry);
+                // Re-GET before refreshing: if the lock was released or taken
+                // over by another agent since the listing, an unconditional PUT
+                // would resurrect/steal it. Only refresh when it still exists
+                // and is still ours. (A small TOCTOU window remains, inherent to
+                // stores without compare-and-set on PUT.)
+                match self.get_at(&key)? {
+                    Some(current) if current.agent_id == agent_id => {
+                        let updated = LockEntry {
+                            symbol_id: entry.symbol_id,
+                            agent_id: entry.agent_id,
+                            intent: entry.intent,
+                            locked_at: now.clone(),
+                            ttl_seconds,
+                            mode: entry.mode,
+                        };
+                        self.put_at(&key, &updated)?;
+                        count += 1;
+                    }
+                    _ => {
+                        // Released or taken over — do not resurrect.
+                    }
+                }
             }
         }
         Ok(count)

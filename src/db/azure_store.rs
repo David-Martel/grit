@@ -9,7 +9,10 @@ use super::lock_store::{LockEntry, LockResult, LockStore};
 /// Azure Blob Storage backend (native API).
 ///
 /// Uses `If-None-Match: *` on PUT for atomic lock acquisition.
-/// Events are emitted automatically via Azure Event Grid on blob create/delete.
+///
+/// Note: grit does not emit events itself. Blob create/delete can be observed
+/// in real time only if an Azure Event Grid subscription is configured on the
+/// container out of band — `grit watch` then consumes those events.
 pub struct AzureLockStore {
     client: ContainerClient,
     prefix: String,
@@ -107,6 +110,23 @@ impl AzureLockStore {
                     Ok(())
                 } else {
                     Err(anyhow::anyhow!("Azure DELETE failed: {}", e))
+                }
+            }
+        }
+    }
+
+    /// GET and parse the blob at an explicit key, None if absent.
+    fn get_at(&self, key: &str) -> Result<Option<LockEntry>> {
+        let blob = self.client.blob_client(key);
+        let result = self.rt.block_on(async { blob.get_content().await });
+        match result {
+            Ok(data) => Ok(Some(serde_json::from_slice(&data).context("Failed to parse lock entry")?)),
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("BlobNotFound") || s.contains("404") || s.contains("not found") {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Azure GET failed: {}", e))
                 }
             }
         }
@@ -411,14 +431,24 @@ impl LockStore for AzureLockStore {
         let mut count = 0;
         for entry in all {
             if entry.agent_id == agent_id {
-                let updated = LockEntry {
-                    locked_at: now.clone(),
-                    ttl_seconds,
-                    ..entry
-                };
-                // Refresh at the entry's real key (reader keyspace for reads).
-                self.put_at(&self.key_for_entry(&updated), &updated)?;
-                count += 1;
+                let key = self.key_for_entry(&entry);
+                // Re-GET before refreshing so a concurrently released/stolen
+                // lock is not resurrected by an unconditional PUT. Only refresh
+                // when it still exists and is still ours.
+                match self.get_at(&key)? {
+                    Some(current) if current.agent_id == agent_id => {
+                        let updated = LockEntry {
+                            locked_at: now.clone(),
+                            ttl_seconds,
+                            ..entry
+                        };
+                        self.put_at(&key, &updated)?;
+                        count += 1;
+                    }
+                    _ => {
+                        // Released or taken over — do not resurrect.
+                    }
+                }
             }
         }
         Ok(count)
