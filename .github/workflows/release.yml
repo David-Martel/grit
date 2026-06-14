@@ -38,10 +38,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            cross: true
+          # No aarch64-unknown-linux-gnu: a transitive openssl-sys dependency
+          # (aws/azure) has no ARM64 OpenSSL in the cross environment, so this
+          # target never built (v0.3.0 shipped with no assets either). Re-add it
+          # later with rustls or a vendored OpenSSL cross setup.
           # No Windows target: grit uses Unix domain sockets (Unix/macOS-only).
 
     steps:
