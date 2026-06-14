@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/rtk-ai/grit/compare/v0.3.0...v0.4.0) (2026-06-14)
+
+
+### Features
+
+* real shared read locks on S3/Azure backends ([#16](https://github.com/rtk-ai/grit/issues/16)) ([#25](https://github.com/rtk-ai/grit/issues/25)) ([59f349b](https://github.com/rtk-ai/grit/commit/59f349be7ecf62e028587b74018ac7ebe4f18ae0))
+
+
+### Bug Fixes
+
+* close lock-protocol P0/P1 holes (atomic claim, merge-lock liveness, session branch) ([#23](https://github.com/rtk-ai/grit/issues/23)) ([8ad1fa5](https://github.com/rtk-ai/grit/commit/8ad1fa5e654f826e96a266e45fb73a6f7f1a0e21))
+* make S3 lock acquisition fail closed, never silently non-atomic (P0) ([#24](https://github.com/rtk-ai/grit/issues/24)) ([ae8bded](https://github.com/rtk-ai/grit/commit/ae8bded9a0760f8cbc06b2fa013fb320f1d16b2b))
+* P2/P3 cloud-backend hardening (refresh resurrection, Event Grid doc) ([#28](https://github.com/rtk-ai/grit/issues/28)) ([c75aea9](https://github.com/rtk-ai/grit/commit/c75aea96c3a32527e3b6c2b672030f98fc4da687))
+* P2/P3 hardening — queue FIFO, availability, migrations, git robustness ([#27](https://github.com/rtk-ai/grit/issues/27)) ([db8b068](https://github.com/rtk-ai/grit/commit/db8b0685243f3fac9de314a2f457296edd799a39))
+* prevent repo corruption and commit loss in `grit done` ([#21](https://github.com/rtk-ai/grit/issues/21)) ([#22](https://github.com/rtk-ai/grit/issues/22)) ([65f0ebb](https://github.com/rtk-ai/grit/commit/65f0ebbd3a3dbcaf1eeaabf751a57b187c19b97e))
+
 ## [0.3.0](https://github.com/rtk-ai/grit/compare/v0.2.0...v0.3.0) (2026-04-06)
 
 
