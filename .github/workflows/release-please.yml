@@ -49,3 +49,49 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -fa latest -m "Latest stable release (${{ needs.release-please.outputs.tag_name }})"
           git push origin latest --force
+
+  # ─── Post-release: back-merge release commits to develop ───
+  #
+  # release-please commits (version bump + CHANGELOG) land only on master, so
+  # develop falls one commit behind on every release. Without this job the
+  # drift accumulates and the next develop -> master PR carries no-op churn.
+  back-merge-develop:
+    name: Back-merge master into develop
+    needs: [release-please, build-release]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: develop
+
+      - name: Open back-merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="chore/back-merge-master-${TAG}"
+          git checkout -b "$BRANCH"
+
+          # Fast-forward when possible (release-please commits are linear on top
+          # of develop); fall back to a merge commit if develop diverged.
+          if ! git merge origin/master --ff-only 2>/dev/null; then
+            git merge origin/master --no-edit \
+              -m "chore: back-merge master into develop (${TAG})"
+          fi
+
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base develop \
+            --head "$BRANCH" \
+            --title "chore: sync release ${TAG} into develop" \
+            --body "Automated back-merge of release-please commits from \`master\` into \`develop\` so the next \`develop -> master\` PR stays free of release-commit drift." \
+            --label "automated"
