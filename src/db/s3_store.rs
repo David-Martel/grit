@@ -165,20 +165,53 @@ impl S3LockStore {
 
         match result {
             Ok(_) => return Ok(true),
-            // 412 Precondition Failed = object already exists (AWS S3 / R2)
-            Err(SdkError::ServiceError(ref service_err))
-                if service_err.raw().status().as_u16() == 412 =>
-            {
-                return Ok(false);
+            Err(SdkError::ServiceError(ref service_err)) => {
+                let status = service_err.raw().status().as_u16();
+                // 412 Precondition Failed = object already exists (AWS S3 / R2).
+                if status == 412 {
+                    return Ok(false);
+                }
+                // Only treat the request as "conditional PUT unsupported" for the
+                // specific signals a provider gives when it does not implement
+                // If-None-Match (MinIO / older S3 clones): 501 Not Implemented, or
+                // a 400 carrying a NotImplemented / PreconditionNotSupported code.
+                // For ANY other service error (timeout-as-5xx, throttling, auth,
+                // transient 500) we must NOT silently degrade to non-atomic
+                // last-writer-wins — that would let two agents win the same write
+                // lock. Fail closed instead.
+                let code = aws_sdk_s3::error::ProvideErrorMetadata::code(service_err.err())
+                    .unwrap_or_default();
+                let unsupported = status == 501
+                    || (status == 400
+                        && (code == "NotImplemented" || code == "PreconditionNotSupported"));
+                if !unsupported {
+                    anyhow::bail!(
+                        "S3 conditional PUT failed (status {status}, code '{code}'); \
+                         refusing to fall back to non-atomic locking to avoid granting \
+                         two agents the same lock"
+                    );
+                }
+                // else: fall through to the GET-first fallback below.
             }
-            // Other error = provider doesn't support If-None-Match (MinIO, GCS, Azure)
-            // Fall through to check-existing approach
-            Err(_) => {}
+            // Non-service errors (dispatch / timeout / construction) are operational
+            // failures, not "feature unsupported": fail closed.
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context("S3 conditional PUT failed; refusing non-atomic fallback"));
+            }
         }
 
-        // Fallback for providers without conditional PUT (MinIO, GCS):
-        // Use optimistic locking: write our lock, then re-read to verify ownership.
-        // If another agent also wrote, last-writer-wins — the loser detects on re-read.
+        // Fallback ONLY for providers that genuinely lack conditional PUT (MinIO,
+        // GCS via S3 API). Do a GET-first compare-and-set instead of an
+        // unconditional overwrite: if any lock object already exists, report
+        // not-acquired and let the caller's expiry/compatibility logic decide.
+        // This no longer clobbers a live lock held by another agent. A small
+        // TOCTOU window remains (inherent to stores without atomic conditional
+        // writes) and is closed by the post-write ownership re-read.
+        if self.get_lock(&entry.symbol_id)?.is_some() {
+            return Ok(false);
+        }
+
         self.put_lock(entry)?;
 
         // Brief pause to let the write propagate (GCS is strongly consistent since 2021,
@@ -189,7 +222,7 @@ impl S3LockStore {
         match self.get_lock(&entry.symbol_id)? {
             Some(stored) if stored.agent_id == entry.agent_id => Ok(true),
             Some(_) => {
-                // Another agent overwrote our lock — we lost
+                // Another agent raced us and wrote last — we lost.
                 Ok(false)
             }
             None => Ok(true), // Lock vanished, treat as success
