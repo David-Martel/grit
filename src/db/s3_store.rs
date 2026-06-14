@@ -23,6 +23,14 @@ pub struct S3LockStore {
 
 const DEFAULT_LOCK_PREFIX: &str = ".grit/locks/";
 
+/// Outcome of reserving the exclusive write slot for a symbol.
+enum WriteReserve {
+    /// We now hold the write slot and must still verify reader compatibility.
+    Reserved,
+    /// A terminal result was reached (own-lock refresh granted, or blocked).
+    Terminal(LockResult),
+}
+
 impl S3LockStore {
     /// Build from config
     pub fn from_config(config: &S3Config) -> Result<Self> {
@@ -70,6 +78,160 @@ impl S3LockStore {
 
     fn lock_key(&self, symbol_id: &str) -> String {
         format!("{}{}", self.prefix, urlencoding::encode(symbol_id))
+    }
+
+    /// Key for a per-agent shared READ lock. Each reader gets its own object so
+    /// multiple readers of the same symbol coexist and are tracked, released
+    /// and refreshed independently (single-key-per-symbol cannot represent
+    /// multiple holders). Write locks keep the canonical `lock_key`.
+    fn reader_key(&self, symbol_id: &str, agent_id: &str) -> String {
+        format!(
+            "{}r/{}/{}",
+            self.prefix,
+            urlencoding::encode(symbol_id),
+            urlencoding::encode(agent_id)
+        )
+    }
+
+    /// The object key that actually stores `entry`, picking the reader keyspace
+    /// for read locks and the canonical key for write locks.
+    fn key_for_entry(&self, entry: &LockEntry) -> String {
+        if entry.mode == "read" {
+            self.reader_key(&entry.symbol_id, &entry.agent_id)
+        } else {
+            self.lock_key(&entry.symbol_id)
+        }
+    }
+
+    /// PUT an object at an explicit key (unconditional).
+    fn put_at(&self, key: &str, entry: &LockEntry) -> Result<()> {
+        let body = serde_json::to_vec(entry)?;
+        self.rt.block_on(async {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .content_type("application/json")
+                .send()
+                .await
+        }).context("S3 PUT failed")?;
+        Ok(())
+    }
+
+    /// DELETE an object at an explicit key.
+    fn delete_at(&self, key: &str) -> Result<()> {
+        self.rt.block_on(async {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+        }).context("S3 DELETE failed")?;
+        Ok(())
+    }
+
+    /// List the non-expired READ locks held on `symbol_id` by other agents.
+    fn other_active_readers(&self, symbol_id: &str, agent_id: &str) -> Result<Vec<LockEntry>> {
+        let prefix = format!("{}r/{}/", self.prefix, urlencoding::encode(symbol_id));
+        let entries = self.list_under_prefix(&prefix)?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.agent_id != agent_id && !Self::is_entry_expired(e))
+            .collect())
+    }
+
+    /// Reserve the exclusive write slot for `entry` (the canonical lock key),
+    /// reclaiming an expired holder and refreshing our own existing write lock.
+    fn reserve_write_slot(&self, entry: &LockEntry) -> Result<WriteReserve> {
+        for _attempt in 0..3 {
+            if self.put_lock_if_absent(entry)? {
+                return Ok(WriteReserve::Reserved);
+            }
+            match self.get_lock(&entry.symbol_id)? {
+                Some(existing) if existing.agent_id == entry.agent_id => {
+                    // Refresh our own write lock.
+                    self.put_lock(entry)?;
+                    return Ok(WriteReserve::Terminal(LockResult::Granted));
+                }
+                Some(existing) if Self::is_entry_expired(&existing) => {
+                    // Reclaim an expired holder, then retry the reservation.
+                    self.delete_lock(&entry.symbol_id)?;
+                }
+                Some(existing) => {
+                    return Ok(WriteReserve::Terminal(LockResult::Blocked {
+                        by_agent: existing.agent_id,
+                        by_intent: existing.intent,
+                    }));
+                }
+                None => {
+                    // Vanished between conditional PUT and GET — retry.
+                }
+            }
+        }
+        if let Some(holder) = self.get_lock(&entry.symbol_id)? {
+            return Ok(WriteReserve::Terminal(LockResult::Blocked {
+                by_agent: holder.agent_id,
+                by_intent: holder.intent,
+            }));
+        }
+        anyhow::bail!("Failed to acquire write lock after retries")
+    }
+
+    /// Acquire an exclusive write lock: reserve the slot, then back off if any
+    /// other agent holds an active read lock (a writer is incompatible with
+    /// readers). The reserve-then-verify ordering guarantees we never grant a
+    /// writer while a reader is live; under a tie both sides back off and the
+    /// caller retries (no double grant).
+    fn try_write_lock(&self, entry: &LockEntry) -> Result<LockResult> {
+        match self.reserve_write_slot(entry)? {
+            WriteReserve::Terminal(result) => Ok(result),
+            WriteReserve::Reserved => {
+                let readers = self.other_active_readers(&entry.symbol_id, &entry.agent_id)?;
+                if let Some(r) = readers.into_iter().next() {
+                    // Release our reservation so the live readers can finish.
+                    self.delete_lock(&entry.symbol_id)?;
+                    Ok(LockResult::Blocked { by_agent: r.agent_id, by_intent: r.intent })
+                } else {
+                    Ok(LockResult::Granted)
+                }
+            }
+        }
+    }
+
+    /// Acquire a shared read lock: blocked only by another agent's active write
+    /// lock. Each reader persists its own per-agent object, then re-verifies no
+    /// writer slipped in (and backs off if one did).
+    fn try_read_lock(&self, entry: &LockEntry) -> Result<LockResult> {
+        let symbol_id = &entry.symbol_id;
+        let agent_id = &entry.agent_id;
+
+        // 1. A non-expired write lock by another agent blocks reads.
+        if let Some(w) = self.get_lock(symbol_id)? {
+            if w.agent_id == *agent_id {
+                // We already hold the write lock; a read is redundant — grant.
+                return Ok(LockResult::Granted);
+            }
+            if Self::is_entry_expired(&w) {
+                self.delete_lock(symbol_id)?;
+            } else {
+                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+            }
+        }
+
+        // 2. Persist our per-agent reader object (readers never conflict).
+        self.put_at(&self.reader_key(symbol_id, agent_id), entry)?;
+
+        // 3. Re-verify no writer reserved the slot after our check; back off if so.
+        if let Some(w) = self.get_lock(symbol_id)? {
+            if w.agent_id != *agent_id && !Self::is_entry_expired(&w) {
+                let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
+                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+            }
+        }
+
+        Ok(LockResult::Granted)
     }
 
     fn parse_entry(&self, body: &[u8]) -> Result<LockEntry> {
@@ -245,6 +407,11 @@ impl S3LockStore {
 
     /// LIST all lock objects, fetching bodies in parallel
     fn list_all_locks(&self) -> Result<Vec<LockEntry>> {
+        self.list_under_prefix(&self.prefix)
+    }
+
+    /// List and parse all lock objects under an explicit key prefix.
+    fn list_under_prefix(&self, prefix: &str) -> Result<Vec<LockEntry>> {
         let mut all_keys: Vec<String> = Vec::new();
         let mut continuation_token: Option<String> = None;
 
@@ -253,7 +420,7 @@ impl S3LockStore {
             let mut req = self.client
                 .list_objects_v2()
                 .bucket(&self.bucket)
-                .prefix(&self.prefix);
+                .prefix(prefix);
 
             if let Some(ref token) = continuation_token {
                 req = req.continuation_token(token);
@@ -324,59 +491,17 @@ impl LockStore for S3LockStore {
             mode: mode.to_string(),
         };
 
-        // Try atomic PUT
-        if self.put_lock_if_absent(&entry)? {
-            return Ok(LockResult::Granted);
+        if mode == "read" {
+            self.try_read_lock(&entry)
+        } else {
+            self.try_write_lock(&entry)
         }
-
-        // Object exists — check who holds it
-        if let Some(existing) = self.get_lock(symbol_id)? {
-            // Same agent? Re-lock (update TTL)
-            if existing.agent_id == agent_id {
-                self.put_lock(&entry)?;
-                return Ok(LockResult::Granted);
-            }
-
-            // Different agent — check if expired
-            if Self::is_entry_expired(&existing) {
-                self.delete_lock(symbol_id)?;
-                // Retry atomic PUT
-                if self.put_lock_if_absent(&entry)? {
-                    return Ok(LockResult::Granted);
-                }
-                // Someone else grabbed it between our delete and put
-                if let Some(new_existing) = self.get_lock(symbol_id)? {
-                    return Ok(LockResult::Blocked {
-                        by_agent: new_existing.agent_id,
-                        by_intent: new_existing.intent,
-                    });
-                }
-            }
-
-            // Read/write compatibility: read + read = OK
-            if mode == "read" && existing.mode == "read" {
-                // For S3, we allow the read claim without overwriting the existing entry.
-                // The caller gets Granted but the S3 object still belongs to the first reader.
-                // This is a simplification -- S3 doesn't support multi-row locks.
-                return Ok(LockResult::Granted);
-            }
-
-            return Ok(LockResult::Blocked {
-                by_agent: existing.agent_id,
-                by_intent: existing.intent,
-            });
-        }
-
-        // Object vanished between conditional PUT and GET — retry
-        if self.put_lock_if_absent(&entry)? {
-            return Ok(LockResult::Granted);
-        }
-
-        anyhow::bail!("Failed to acquire lock after retries")
     }
 
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
-        // Verify ownership before deleting
+        // An agent may hold either a write lock (canonical key) or a per-agent
+        // read lock — release whichever it owns. Reader deletion is idempotent.
+        let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
         if let Some(entry) = self.get_lock(symbol_id)? {
             if entry.agent_id == agent_id {
                 self.delete_lock(symbol_id)?;
@@ -390,7 +515,9 @@ impl LockStore for S3LockStore {
         let mut count = 0;
         for entry in &all {
             if entry.agent_id == agent_id {
-                self.delete_lock(&entry.symbol_id)?;
+                // Delete at the entry's real key (reader keyspace for read locks,
+                // canonical key for write locks).
+                self.delete_at(&self.key_for_entry(entry))?;
                 count += 1;
             }
         }
@@ -416,7 +543,7 @@ impl LockStore for S3LockStore {
         let mut count = 0;
         for entry in &all {
             if Self::is_entry_expired(entry) {
-                self.delete_lock(&entry.symbol_id)?;
+                self.delete_at(&self.key_for_entry(entry))?;
                 count += 1;
             }
         }
@@ -437,7 +564,8 @@ impl LockStore for S3LockStore {
                     ttl_seconds,
                     mode: entry.mode,
                 };
-                self.put_lock(&updated)?;
+                // Refresh at the entry's real key (reader keyspace for reads).
+                self.put_at(&self.key_for_entry(&updated), &updated)?;
                 count += 1;
             }
         }
