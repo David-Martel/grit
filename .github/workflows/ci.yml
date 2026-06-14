@@ -17,13 +17,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Windows is intentionally excluded: the notification room uses Unix
+        # domain sockets (std::os::unix::net), so grit is Unix/macOS-only for now.
         include:
           - name: macOS
             os: macos-latest
           - name: Linux
             os: ubuntu-latest
-          - name: Windows
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4

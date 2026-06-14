@@ -42,9 +42,7 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             cross: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
+          # No Windows target: grit uses Unix domain sockets (Unix/macOS-only).
 
     steps:
       - name: Checkout
