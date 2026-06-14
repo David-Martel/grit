@@ -8,3 +8,18 @@ benchmark-grit-vs-git.png
 gen_pdf.py
 git-agents-problem.*
 .fastembed_cache/
+
+# Secrets and credentials — never commit. `grit config set-azure/set-s3` writes
+# access keys into .grit/config.json (already covered by the .grit rule above);
+# these patterns guard against stray credential files landing in the repo.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*credentials*
+*secret*.json
+.aws/
+.azure/
