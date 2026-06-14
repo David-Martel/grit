@@ -33,7 +33,12 @@ impl GitRepo {
         // survived a previous run, reuse it but warn loudly — the worktree will
         // resume on top of whatever commits that branch already carries.
         let branch_exists = Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch_name)])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", branch_name),
+            ])
             .current_dir(&self.root)
             .output()
             .map(|o| o.status.success())
@@ -45,19 +50,35 @@ impl GitRepo {
                 branch_name, agent_id
             );
             Command::new("git")
-                .args(["worktree", "add", "--", &wt_path.to_string_lossy(), &branch_name])
+                .args([
+                    "worktree",
+                    "add",
+                    "--",
+                    &wt_path.to_string_lossy(),
+                    &branch_name,
+                ])
                 .current_dir(&self.root)
                 .output()
         } else {
             Command::new("git")
-                .args(["worktree", "add", "-b", &branch_name, "--", &wt_path.to_string_lossy()])
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    "--",
+                    &wt_path.to_string_lossy(),
+                ])
                 .current_dir(&self.root)
                 .output()
         }
         .context("Failed to run git worktree add")?;
 
         if !output.status.success() {
-            anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(wt_path)
@@ -77,7 +98,13 @@ impl GitRepo {
         }
 
         let output = Command::new("git")
-            .args(["worktree", "remove", "--force", "--", &wt_path.to_string_lossy()])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                &wt_path.to_string_lossy(),
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree remove")?;
@@ -172,7 +199,10 @@ impl GitRepo {
             .current_dir(&self.root)
             .output()
             .context("Failed to check main worktree status")?;
-        if !String::from_utf8_lossy(&main_status.stdout).trim().is_empty() {
+        if !String::from_utf8_lossy(&main_status.stdout)
+            .trim()
+            .is_empty()
+        {
             anyhow::bail!(
                 "main worktree at {} has uncommitted changes; refusing to merge \
                  agent/{} to avoid corrupting the repository. Commit or stash them \
@@ -211,7 +241,13 @@ impl GitRepo {
 
         // Merge the agent branch into current branch
         let output = Command::new("git")
-            .args(["merge", "--no-ff", &branch_name, "-m", &format!("grit: merge agent/{}", agent_id)])
+            .args([
+                "merge",
+                "--no-ff",
+                &branch_name,
+                "-m",
+                &format!("grit: merge agent/{}", agent_id),
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git merge")?;
@@ -244,12 +280,18 @@ impl GitRepo {
         let max_retries = 200; // 200 × 50ms = 10s max wait
         for attempt in 0..max_retries {
             // Try to exclusively create the lock file
-            match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
                 Ok(file) => {
                     use std::io::Write;
                     let mut file = file;
                     let _ = write!(file, "{}", std::process::id());
-                    return Ok(FileLock { path: path.to_path_buf() });
+                    return Ok(FileLock {
+                        path: path.to_path_buf(),
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Decide whether the existing lock is stale. Prefer a
@@ -266,7 +308,9 @@ impl GitRepo {
                         if let Ok(pid) = contents.trim().parse::<u32>() {
                             // Check if process is alive (kill with signal 0)
                             use std::process::Command as Cmd;
-                            if let Ok(output) = Cmd::new("kill").args(["-0", &pid.to_string()]).output() {
+                            if let Ok(output) =
+                                Cmd::new("kill").args(["-0", &pid.to_string()]).output()
+                            {
                                 liveness_known = true;
                                 if !output.status.success() {
                                     // Process is dead -- lock is stale.
@@ -328,7 +372,12 @@ impl GitRepo {
         // so option injection is not a concern (and no `--` separator is used:
         // `git checkout -b -- <branch>` misparses `<branch>` as a start-point).
         let exists = Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch_name)])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", branch_name),
+            ])
             .current_dir(&self.root)
             .output()
             .map(|o| o.status.success())
@@ -414,7 +463,11 @@ impl GitRepo {
             .current_dir(&self.root)
             .output()?;
         if !output.status.success() {
-            anyhow::bail!("git checkout {} failed: {}", branch, String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git checkout {} failed: {}",
+                branch,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(())
     }
@@ -524,7 +577,10 @@ mod tests {
             .current_dir(&root)
             .output()
             .unwrap();
-        assert!(merged.status.success(), "agent commit should be merged into HEAD");
+        assert!(
+            merged.status.success(),
+            "agent commit should be merged into HEAD"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::db::s3_store::S3Config;
 use crate::db::azure_store::AzureConfig;
+use crate::db::s3_store::S3Config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GritConfig {

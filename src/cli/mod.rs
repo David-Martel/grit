@@ -4,17 +4,21 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 use crate::config::GritConfig;
-use crate::db::Database;
-use crate::db::lock_store::{LockEntry, LockStore, LockResult};
-use crate::db::sqlite_store::SqliteLockStore;
-use crate::db::s3_store::S3Config;
 use crate::db::azure_store::AzureConfig;
+use crate::db::lock_store::{LockEntry, LockResult, LockStore};
+use crate::db::s3_store::S3Config;
+use crate::db::sqlite_store::SqliteLockStore;
+use crate::db::Database;
 use crate::git::GitRepo;
 use crate::parser::SymbolIndex;
-use crate::room::{Room, RoomEvent, EventType, NotificationServer};
+use crate::room::{EventType, NotificationServer, Room, RoomEvent};
 
 #[derive(Parser)]
-#[command(name = "grit", version, about = "Coordination layer for parallel AI agents on top of git")]
+#[command(
+    name = "grit",
+    version,
+    about = "Coordination layer for parallel AI agents on top of git"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -260,10 +264,21 @@ fn validate_identifier(id: &str, label: &str) -> Result<()> {
         anyhow::bail!("Invalid {}: must not be empty", label);
     }
     if id.contains('/') || id.contains('\\') || id.contains("..") || id.starts_with('-') {
-        anyhow::bail!("Invalid {}: '{}' contains forbidden characters (/, \\, ..) or starts with -", label, id);
+        anyhow::bail!(
+            "Invalid {}: '{}' contains forbidden characters (/, \\, ..) or starts with -",
+            label,
+            id
+        );
     }
-    if !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        anyhow::bail!("Invalid {}: '{}' must contain only alphanumeric, hyphens, underscores, dots", label, id);
+    if !id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        anyhow::bail!(
+            "Invalid {}: '{}' must contain only alphanumeric, hyphens, underscores, dots",
+            label,
+            id
+        );
     }
     Ok(())
 }
@@ -271,11 +286,15 @@ fn validate_identifier(id: &str, label: &str) -> Result<()> {
 pub fn run(cli: Cli) -> Result<()> {
     // Validate identifiers early to prevent path traversal / argument injection
     match &cli.command {
-        Command::Claim { agent, .. } | Command::Release { agent, .. }
-        | Command::Done { agent } | Command::Plan { agent, .. }
+        Command::Claim { agent, .. }
+        | Command::Release { agent, .. }
+        | Command::Done { agent }
+        | Command::Plan { agent, .. }
         | Command::Heartbeat { agent, .. }
         | Command::Assign { agent, .. } => validate_identifier(agent, "agent ID")?,
-        Command::Session { action: SessionAction::Start { name } } => {
+        Command::Session {
+            action: SessionAction::Start { name },
+        } => {
             validate_identifier(name, "session name")?;
         }
         _ => {}
@@ -283,7 +302,18 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Init => cmd_init(&cli.repo),
-        Command::Claim { agent, intent, ttl, wait, mode, queue, with_deps, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, wait, &mode, queue, with_deps, &symbols),
+        Command::Claim {
+            agent,
+            intent,
+            ttl,
+            wait,
+            mode,
+            queue,
+            with_deps,
+            symbols,
+        } => cmd_claim(
+            &cli.repo, &agent, &intent, ttl, wait, &mode, queue, with_deps, &symbols,
+        ),
         Command::Release { agent, symbols } => cmd_release(&cli.repo, &agent, &symbols),
         Command::Status => cmd_status(&cli.repo),
         Command::Symbols { file } => cmd_symbols(&cli.repo, file.as_deref()),
@@ -295,7 +325,9 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Queue { action } => match action {
             QueueAction::List => cmd_queue_list(&cli.repo),
-            QueueAction::Cancel { agent, symbol } => cmd_queue_cancel(&cli.repo, &agent, symbol.as_deref()),
+            QueueAction::Cancel { agent, symbol } => {
+                cmd_queue_cancel(&cli.repo, &agent, symbol.as_deref())
+            }
         },
         Command::Gc => cmd_gc(&cli.repo),
         Command::Session { action } => match action {
@@ -305,13 +337,27 @@ pub fn run(cli: Cli) -> Result<()> {
             SessionAction::End { name } => cmd_session_end(&cli.repo, name.as_deref()),
         },
         Command::Config { action } => match action {
-            ConfigAction::SetS3 { bucket, endpoint, region } => cmd_config_set_s3(&cli.repo, &bucket, endpoint.as_deref(), &region),
-            ConfigAction::SetAzure { account, access_key, container } => cmd_config_set_azure(&cli.repo, &account, &access_key, &container),
+            ConfigAction::SetS3 {
+                bucket,
+                endpoint,
+                region,
+            } => cmd_config_set_s3(&cli.repo, &bucket, endpoint.as_deref(), &region),
+            ConfigAction::SetAzure {
+                account,
+                access_key,
+                container,
+            } => cmd_config_set_azure(&cli.repo, &account, &access_key, &container),
             ConfigAction::SetLocal => cmd_config_set_local(&cli.repo),
             ConfigAction::Show => cmd_config_show(&cli.repo),
         },
         Command::Heartbeat { agent, ttl } => cmd_heartbeat(&cli.repo, &agent, ttl),
-        Command::Assign { agent, intent, file, ttl, mode } => cmd_assign(&cli.repo, &agent, &intent, &file, ttl, &mode),
+        Command::Assign {
+            agent,
+            intent,
+            file,
+            ttl,
+            mode,
+        } => cmd_assign(&cli.repo, &agent, &intent, &file, ttl, &mode),
     }
 }
 
@@ -391,7 +437,10 @@ fn cmd_init(repo: &str) -> Result<()> {
     };
     if should_add {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&gitignore)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore)?;
         writeln!(f, "\n.grit")?;
     }
 
@@ -407,7 +456,18 @@ fn cmd_init(repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &str, queue: bool, with_deps: bool, symbols: &[String]) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_claim(
+    repo: &str,
+    agent: &str,
+    intent: &str,
+    ttl: u64,
+    wait: u64,
+    mode: &str,
+    queue: bool,
+    with_deps: bool,
+    symbols: &[String],
+) -> Result<()> {
     if mode != "read" && mode != "write" {
         anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
     }
@@ -424,20 +484,21 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
     let symbols = if with_deps {
         let mut expanded = symbols.to_vec();
         for sym_id in symbols {
-            match db.get_transitive_deps(sym_id) {
-                Ok(deps) => {
-                    for dep in deps {
-                        if !expanded.contains(&dep) {
-                            dep_set.insert(dep.clone());
-                            expanded.push(dep);
-                        }
+            if let Ok(deps) = db.get_transitive_deps(sym_id) {
+                for dep in deps {
+                    if !expanded.contains(&dep) {
+                        dep_set.insert(dep.clone());
+                        expanded.push(dep);
                     }
                 }
-                Err(_) => {}
             }
         }
         if !dep_set.is_empty() {
-            println!("{} Auto-locking {} dependencies as read:", "+".cyan(), dep_set.len());
+            println!(
+                "{} Auto-locking {} dependencies as read:",
+                "+".cyan(),
+                dep_set.len()
+            );
             for d in &dep_set {
                 println!("  {} {}", ">".cyan(), d);
             }
@@ -461,10 +522,17 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
 
         for sym_id in symbols {
             // Deps are always claimed as read locks
-            let sym_mode = if dep_set.contains(sym_id) { "read" } else { mode };
+            let sym_mode = if dep_set.contains(sym_id) {
+                "read"
+            } else {
+                mode
+            };
             match lock_store.try_lock(sym_id, agent, intent, ttl, sym_mode)? {
                 LockResult::Granted => granted.push(sym_id.clone()),
-                LockResult::Blocked { by_agent, by_intent } => {
+                LockResult::Blocked {
+                    by_agent,
+                    by_intent,
+                } => {
                     blocked.push((sym_id.clone(), by_agent, by_intent));
                 }
             }
@@ -512,7 +580,14 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
                     for (s, by, by_intent) in &blocked {
                         db.enqueue(s, agent, intent, mode)?;
                         let pos = db.queue_position(s, agent)?.unwrap_or(0);
-                        println!("{} Queued: {} (position {}, held by {} - {})", "~".yellow(), s, pos, by, by_intent);
+                        println!(
+                            "{} Queued: {} (position {}, held by {} - {})",
+                            "~".yellow(),
+                            s,
+                            pos,
+                            by,
+                            by_intent
+                        );
                     }
                 } else {
                     println!("{} Blocked:", "x".red());
@@ -521,7 +596,10 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
                     }
                 }
 
-                let files: Vec<&str> = symbols.iter().filter_map(|s| s.split("::").next()).collect();
+                let files: Vec<&str> = symbols
+                    .iter()
+                    .filter_map(|s| s.split("::").next())
+                    .collect();
                 let available = db.available_symbols_in_files(&files)?;
                 if !available.is_empty() {
                     println!("\n{} Available in same files:", "?".yellow());
@@ -550,7 +628,9 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &
         }
 
         // Sleep with backoff: 1s -> 2s -> 4s -> 5s (cap), never past deadline
-        let remaining = deadline.unwrap().saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             continue; // one final attempt
         }
@@ -587,14 +667,23 @@ fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
     room.notify(&RoomEvent {
         event_type: EventType::Released,
         agent: agent.to_string(),
-        symbols: if symbols.is_empty() { vec!["(all)".to_string()] } else { symbols.to_vec() },
+        symbols: if symbols.is_empty() {
+            vec!["(all)".to_string()]
+        } else {
+            symbols.to_vec()
+        },
     });
 
     Ok(())
 }
 
 /// Promote the next queued agent for each released symbol
-fn promote_queued(db: &Database, lock_store: &dyn LockStore, symbols: &[String], grit_dir: &std::path::Path) -> Result<()> {
+fn promote_queued(
+    db: &Database,
+    lock_store: &dyn LockStore,
+    symbols: &[String],
+    grit_dir: &std::path::Path,
+) -> Result<()> {
     let room = Room::new(grit_dir);
     for sym_id in symbols {
         // Drain the queue head for this symbol. A granted WRITE lock is
@@ -611,7 +700,12 @@ fn promote_queued(db: &Database, lock_store: &dyn LockStore, symbols: &[String],
             match lock_store.try_lock(sym_id, &next_agent, &next_intent, 600, &next_mode)? {
                 LockResult::Granted => {
                     db.dequeue(sym_id, &next_agent)?;
-                    println!("{} Auto-granted {} to {} (from queue)", "+".green(), sym_id, next_agent);
+                    println!(
+                        "{} Auto-granted {} to {} (from queue)",
+                        "+".green(),
+                        sym_id,
+                        next_agent
+                    );
                     room.notify(&RoomEvent {
                         event_type: EventType::Claimed,
                         agent: next_agent,
@@ -645,12 +739,14 @@ fn cmd_status(repo: &str) -> Result<()> {
         return Ok(());
     }
 
-
     // Group by agent
     let mut by_agent: std::collections::BTreeMap<String, Vec<&LockEntry>> =
         std::collections::BTreeMap::new();
     for entry in &locks {
-        by_agent.entry(entry.agent_id.clone()).or_default().push(entry);
+        by_agent
+            .entry(entry.agent_id.clone())
+            .or_default()
+            .push(entry);
     }
 
     for (agent, entries) in &by_agent {
@@ -666,7 +762,14 @@ fn cmd_status(repo: &str) -> Result<()> {
                 format!("ttl={}s", entry.ttl_seconds)
             };
             let mode_str = if entry.mode == "read" { " (read)" } else { "" };
-            println!("  {} {}{} ({}) [{}]", "|".dimmed(), entry.symbol_id, mode_str, entry.locked_at.dimmed(), status);
+            println!(
+                "  {} {}{} ({}) [{}]",
+                "|".dimmed(),
+                entry.symbol_id,
+                mode_str,
+                entry.locked_at.dimmed(),
+                status
+            );
         }
     }
 
@@ -675,8 +778,13 @@ fn cmd_status(repo: &str) -> Result<()> {
     let queue_count = db.list_queue()?.len();
     println!(
         "\n{}/{} symbols locked{}",
-        locked_count, total_symbols,
-        if queue_count > 0 { format!(", {} queued", queue_count) } else { String::new() }
+        locked_count,
+        total_symbols,
+        if queue_count > 0 {
+            format!(", {} queued", queue_count)
+        } else {
+            String::new()
+        }
     );
 
     Ok(())
@@ -693,8 +801,6 @@ fn cmd_symbols(repo: &str, file_filter: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-
-
     let mut current_file = String::new();
     for (_id, file, name, kind, locked_by) in &symbols {
         if file != &current_file {
@@ -705,7 +811,13 @@ fn cmd_symbols(repo: &str, file_filter: Option<&str>) -> Result<()> {
             Some(agent) => format!(" [locked: {}]", agent.red()),
             None => String::new(),
         };
-        println!("  {} {} ({}){}", "|".dimmed(), name, kind.dimmed(), lock_indicator);
+        println!(
+            "  {} {} ({}){}",
+            "|".dimmed(),
+            name,
+            kind.dimmed(),
+            lock_indicator
+        );
     }
 
     Ok(())
@@ -719,7 +831,6 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
     let keywords: Vec<&str> = intent.split_whitespace().collect();
     let suggestions = db.search_symbols(&keywords)?;
 
-
     println!("Planning for: {}", intent.bold());
     println!("\nRelevant symbols:");
 
@@ -728,7 +839,14 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
             Some(agent) => format!("{} ({})", "LOCKED".red(), agent),
             None => "FREE".green().to_string(),
         };
-        println!("  {} {}::{} [{}] {}", ">".dimmed(), file, name, kind, status);
+        println!(
+            "  {} {}::{} [{}] {}",
+            ">".dimmed(),
+            file,
+            name,
+            kind,
+            status
+        );
     }
 
     // Show dependencies for each symbol
@@ -750,13 +868,19 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
             "\nClaim with:\n  grit claim -a {} -i \"{}\" {}",
             agent,
             intent,
-            free.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(" ")
+            free.iter()
+                .map(|s| format!("\"{}\"", s))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         println!(
             "\nClaim with deps:\n  grit claim -a {} -i \"{}\" --with-deps {}",
             agent,
             intent,
-            free.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(" ")
+            free.iter()
+                .map(|s| format!("\"{}\"", s))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
 
@@ -773,7 +897,6 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         println!("Agent {} has no active locks.", agent);
         return Ok(());
     }
-
 
     println!("{} Agent {} finishing:", "+".green(), agent.bold());
     for (sym, _intent) in &locks {
@@ -852,7 +975,9 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         anyhow::bail!(
             "Agent {} locks released but merge failed: {}.\n\
              The agent's changes are still in branch agent/{}.",
-            agent, err, agent
+            agent,
+            err,
+            agent
         );
     }
 
@@ -945,7 +1070,10 @@ fn print_event(event: &RoomEvent) {
 fn cmd_watch_poll(repo: &str, interval_secs: u64) -> Result<()> {
     let lock_store = resolve_lock_store(repo)?;
 
-    println!("Polling for lock changes every {}s (Ctrl+C to stop):\n", interval_secs);
+    println!(
+        "Polling for lock changes every {}s (Ctrl+C to stop):\n",
+        interval_secs
+    );
 
     // Build initial snapshot: symbol_id -> (agent_id, intent)
     let mut prev: std::collections::HashMap<String, (String, String)> = lock_store
@@ -998,7 +1126,6 @@ fn cmd_worktree_list(repo: &str) -> Result<()> {
         return Ok(());
     }
 
-
     println!("{}", "Active worktrees:".bold());
     for agent_id in &worktrees {
         let dir = grit_dir(repo).join("worktrees").join(agent_id);
@@ -1028,7 +1155,15 @@ fn cmd_queue_list(repo: &str) -> Result<()> {
         }
         pos += 1;
         let mode_str = if mode == "read" { " (read)" } else { "" };
-        println!("  {} #{} {} -- {}{} ({})", ">".yellow(), pos, agent_id, intent, mode_str, queued_at.dimmed());
+        println!(
+            "  {} #{} {} -- {}{} ({})",
+            ">".yellow(),
+            pos,
+            agent_id,
+            intent,
+            mode_str,
+            queued_at.dimmed()
+        );
     }
 
     Ok(())
@@ -1065,7 +1200,14 @@ fn cmd_gc(repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_assign(repo: &str, agent: &str, intent: &str, file_pattern: &str, ttl: u64, mode: &str) -> Result<()> {
+fn cmd_assign(
+    repo: &str,
+    agent: &str,
+    intent: &str,
+    file_pattern: &str,
+    ttl: u64,
+    mode: &str,
+) -> Result<()> {
     if mode != "read" && mode != "write" {
         anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
     }
@@ -1081,7 +1223,12 @@ fn cmd_assign(repo: &str, agent: &str, intent: &str, file_pattern: &str, ttl: u6
     }
 
     // Get unique files
-    let files: Vec<&str> = all_symbols.iter().map(|(_, f, _, _, _)| f.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let files: Vec<&str> = all_symbols
+        .iter()
+        .map(|(_, f, _, _, _)| f.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let available = db.available_symbols_in_files(&files)?;
 
     if available.is_empty() {
@@ -1120,11 +1267,16 @@ fn cmd_assign(repo: &str, agent: &str, intent: &str, file_pattern: &str, ttl: u6
 
             Ok(())
         }
-        LockResult::Blocked { by_agent, by_intent } => {
+        LockResult::Blocked {
+            by_agent,
+            by_intent,
+        } => {
             // Race condition — symbol was claimed between availability check and lock attempt
             anyhow::bail!(
                 "Symbol {} was claimed by {} ({}) between check and lock. Try again.",
-                symbol_id, by_agent, by_intent
+                symbol_id,
+                by_agent,
+                by_intent
             );
         }
     }
@@ -1154,7 +1306,6 @@ fn cmd_session_start(repo: &str, name: &str) -> Result<()> {
     let branch = git_repo.create_session_branch(name)?;
     db.create_session(name, &branch, &base_branch)?;
 
-
     println!("{} Session started: {}", "+".green(), name.bold());
     println!("  branch: {}", branch.cyan());
     println!("  base:   {}", base_branch.dimmed());
@@ -1174,8 +1325,6 @@ fn cmd_session_status(repo: &str) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
     let lock_store = resolve_lock_store(repo)?;
-
-
 
     match db.get_active_session()? {
         Some((name, branch, base)) => {
@@ -1211,18 +1360,21 @@ fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
     let db = Database::open(&dir.join("registry.db"))?;
     let git_repo = GitRepo::open(repo)?;
 
-    let (name, branch, base) = db.get_active_session()?
-        .ok_or_else(|| anyhow::anyhow!("No active session. Start one with: grit session start <name>"))?;
+    let (name, branch, base) = db.get_active_session()?.ok_or_else(|| {
+        anyhow::anyhow!("No active session. Start one with: grit session start <name>")
+    })?;
 
     // Check for remaining locks
     let lock_store = resolve_lock_store(repo)?;
     let locks = lock_store.all_locks()?;
     let worktrees = git_repo.list_worktrees()?;
 
-
-
     if !worktrees.is_empty() {
-        println!("{} Warning: {} agents still have active worktrees:", "!".yellow(), worktrees.len());
+        println!(
+            "{} Warning: {} agents still have active worktrees:",
+            "!".yellow(),
+            worktrees.len()
+        );
         for wt in &worktrees {
             println!("  {} {}", ">".yellow(), wt);
         }
@@ -1230,7 +1382,11 @@ fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
     }
 
     if !locks.is_empty() {
-        println!("{} Warning: {} symbols still locked", "!".yellow(), locks.len());
+        println!(
+            "{} Warning: {} symbols still locked",
+            "!".yellow(),
+            locks.len()
+        );
     }
 
     let pr_title = title.unwrap_or(&name);
@@ -1248,7 +1404,11 @@ fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
          Zero merge conflicts by design.\n\n\
          ---\n\
          *Coordinated by [grit](https://github.com/pszymkowiak/grit)*",
-        name, branch, base, total_symbols, locks.len()
+        name,
+        branch,
+        base,
+        total_symbols,
+        locks.len()
     );
 
     println!("Creating PR: {} -> {}", branch.cyan(), base.dimmed());
@@ -1265,10 +1425,9 @@ fn cmd_session_end(repo: &str, _name: Option<&str>) -> Result<()> {
     let lock_store = resolve_lock_store(repo)?;
     let git_repo = GitRepo::open(repo)?;
 
-    let (session_name, _branch, base) = db.get_active_session()?
+    let (session_name, _branch, base) = db
+        .get_active_session()?
         .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-
-
 
     // GC any expired locks
     let expired = lock_store.gc_expired_locks()?;
@@ -1304,7 +1463,6 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
     };
     config.save(&dir)?;
 
-
     println!("{} Backend set to S3", "+".green());
     println!("  bucket:   {}", bucket.cyan());
     if let Some(ep) = endpoint {
@@ -1321,7 +1479,12 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
     Ok(())
 }
 
-fn cmd_config_set_azure(repo: &str, account: &str, access_key: &str, container: &str) -> Result<()> {
+fn cmd_config_set_azure(
+    repo: &str,
+    account: &str,
+    access_key: &str,
+    container: &str,
+) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let config = GritConfig {
         backend: "azure".to_string(),
@@ -1353,7 +1516,6 @@ fn cmd_config_set_local(repo: &str) -> Result<()> {
     };
     config.save(&dir)?;
 
-
     println!("{} Backend set to local (SQLite)", "+".green());
 
     Ok(())
@@ -1362,7 +1524,6 @@ fn cmd_config_set_local(repo: &str) -> Result<()> {
 fn cmd_config_show(repo: &str) -> Result<()> {
     let dir = ensure_initialized(repo)?;
     let config = GritConfig::load(&dir)?;
-
 
     println!("{} Current config:", "*".green());
     println!("  backend: {}", config.backend.cyan());
@@ -1477,8 +1638,12 @@ mod tests {
             .args(["init", repo])
             .output()
             .unwrap();
-        std::fs::write(tmp.path().join("main.rs"), "fn hello() {}
-").unwrap();
+        std::fs::write(
+            tmp.path().join("main.rs"),
+            "fn hello() {}
+",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["-C", repo, "add", "."])
             .output()
@@ -1493,22 +1658,45 @@ mod tests {
 
         // Blocker agent claims a symbol
         let lock_store = resolve_lock_store(repo).unwrap();
-        let result = lock_store.try_lock("main.rs::hello", "blocker", "blocking", 600, "write").unwrap();
+        let result = lock_store
+            .try_lock("main.rs::hello", "blocker", "blocking", 600, "write")
+            .unwrap();
         assert!(matches!(result, LockResult::Granted));
 
         // Agent-2 tries to claim with --wait 2 (should timeout after ~2s)
         let start = std::time::Instant::now();
-        let err = cmd_claim(repo, "agent-2", "want it", 600, 2, "write", false, false, &["main.rs::hello".to_string()]);
+        let err = cmd_claim(
+            repo,
+            "agent-2",
+            "want it",
+            600,
+            2,
+            "write",
+            false,
+            false,
+            &["main.rs::hello".to_string()],
+        );
         let elapsed = start.elapsed();
 
         // Should have failed (blocked)
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("blocked"), "Expected 'blocked' in error: {}", msg);
+        assert!(
+            msg.contains("blocked"),
+            "Expected 'blocked' in error: {}",
+            msg
+        );
 
         // Should have waited at least 1s (first backoff) but not more than 4s
-        assert!(elapsed.as_secs() >= 1, "Should have retried at least once, elapsed: {:?}", elapsed);
-        assert!(elapsed.as_secs() <= 4, "Should not wait too long, elapsed: {:?}", elapsed);
+        assert!(
+            elapsed.as_secs() >= 1,
+            "Should have retried at least once, elapsed: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() <= 4,
+            "Should not wait too long, elapsed: {:?}",
+            elapsed
+        );
     }
-
 }

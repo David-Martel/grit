@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use chrono::Utc;
 
 use super::lock_store::{LockEntry, LockResult, LockStore};
@@ -54,8 +54,8 @@ impl S3LockStore {
                 .operation_attempt_timeout(std::time::Duration::from_secs(5))
                 .build();
 
-            let retry_config = aws_sdk_s3::config::retry::RetryConfig::standard()
-                .with_max_attempts(3);
+            let retry_config =
+                aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3);
 
             let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                 .force_path_style(true)
@@ -70,7 +70,10 @@ impl S3LockStore {
         Ok(Self {
             client,
             bucket: config.bucket.clone(),
-            prefix: config.prefix.clone().unwrap_or_else(|| DEFAULT_LOCK_PREFIX.to_string()),
+            prefix: config
+                .prefix
+                .clone()
+                .unwrap_or_else(|| DEFAULT_LOCK_PREFIX.to_string()),
             _runtime: rt,
             rt: handle,
         })
@@ -106,42 +109,51 @@ impl S3LockStore {
     /// PUT an object at an explicit key (unconditional).
     fn put_at(&self, key: &str, entry: &LockEntry) -> Result<()> {
         let body = serde_json::to_vec(entry)?;
-        self.rt.block_on(async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(body))
-                .content_type("application/json")
-                .send()
-                .await
-        }).context("S3 PUT failed")?;
+        self.rt
+            .block_on(async {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .content_type("application/json")
+                    .send()
+                    .await
+            })
+            .context("S3 PUT failed")?;
         Ok(())
     }
 
     /// DELETE an object at an explicit key.
     fn delete_at(&self, key: &str) -> Result<()> {
-        self.rt.block_on(async {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send()
-                .await
-        }).context("S3 DELETE failed")?;
+        self.rt
+            .block_on(async {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+            })
+            .context("S3 DELETE failed")?;
         Ok(())
     }
 
     /// GET and parse the object at an explicit key, None if absent.
     fn get_at(&self, key: &str) -> Result<Option<LockEntry>> {
         let result = self.rt.block_on(async {
-            self.client.get_object().bucket(&self.bucket).key(key).send().await
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
         });
         match result {
             Ok(output) => {
-                let body = self.rt.block_on(async {
-                    output.body.collect().await.map(|b| b.to_vec())
-                })?;
+                let body = self
+                    .rt
+                    .block_on(async { output.body.collect().await.map(|b| b.to_vec()) })?;
                 Ok(Some(self.parse_entry(&body)?))
             }
             Err(SdkError::ServiceError(ref e)) if e.err().is_no_such_key() => Ok(None),
@@ -210,7 +222,10 @@ impl S3LockStore {
                 if let Some(r) = readers.into_iter().next() {
                     // Release our reservation so the live readers can finish.
                     self.delete_lock(&entry.symbol_id)?;
-                    Ok(LockResult::Blocked { by_agent: r.agent_id, by_intent: r.intent })
+                    Ok(LockResult::Blocked {
+                        by_agent: r.agent_id,
+                        by_intent: r.intent,
+                    })
                 } else {
                     Ok(LockResult::Granted)
                 }
@@ -234,7 +249,10 @@ impl S3LockStore {
             if Self::is_entry_expired(&w) {
                 self.delete_lock(symbol_id)?;
             } else {
-                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
             }
         }
 
@@ -245,7 +263,10 @@ impl S3LockStore {
         if let Some(w) = self.get_lock(symbol_id)? {
             if w.agent_id != *agent_id && !Self::is_entry_expired(&w) {
                 let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
-                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
             }
         }
 
@@ -280,15 +301,13 @@ impl S3LockStore {
 
         match result {
             Ok(output) => {
-                let body = self.rt.block_on(async {
-                    output.body.collect().await.map(|b| b.to_vec())
-                })?;
+                let body = self
+                    .rt
+                    .block_on(async { output.body.collect().await.map(|b| b.to_vec()) })?;
                 let entry = self.parse_entry(&body)?;
                 Ok(Some(entry))
             }
-            Err(SdkError::ServiceError(ref service_err))
-                if service_err.err().is_no_such_key() =>
-            {
+            Err(SdkError::ServiceError(ref service_err)) if service_err.err().is_no_such_key() => {
                 Ok(None)
             }
             Err(SdkError::ServiceError(ref service_err))
@@ -296,9 +315,7 @@ impl S3LockStore {
             {
                 Ok(None)
             }
-            Err(err) => {
-                Err(anyhow::anyhow!("S3 GET failed: {}", err))
-            }
+            Err(err) => Err(anyhow::anyhow!("S3 GET failed: {}", err)),
         }
     }
 
@@ -307,16 +324,18 @@ impl S3LockStore {
         let key = self.lock_key(&entry.symbol_id);
         let body = serde_json::to_vec(entry)?;
 
-        self.rt.block_on(async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(ByteStream::from(body))
-                .content_type("application/json")
-                .send()
-                .await
-        }).context("S3 PUT failed")?;
+        self.rt
+            .block_on(async {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .body(ByteStream::from(body))
+                    .content_type("application/json")
+                    .send()
+                    .await
+            })
+            .context("S3 PUT failed")?;
 
         Ok(())
     }
@@ -412,14 +431,16 @@ impl S3LockStore {
     /// DELETE a lock object
     fn delete_lock(&self, symbol_id: &str) -> Result<()> {
         let key = self.lock_key(symbol_id);
-        self.rt.block_on(async {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await
-        }).context("S3 DELETE failed")?;
+        self.rt
+            .block_on(async {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+            })
+            .context("S3 DELETE failed")?;
         Ok(())
     }
 
@@ -435,7 +456,8 @@ impl S3LockStore {
 
         // Phase 1: collect all keys
         loop {
-            let mut req = self.client
+            let mut req = self
+                .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix);
@@ -444,7 +466,9 @@ impl S3LockStore {
                 req = req.continuation_token(token);
             }
 
-            let output = self.rt.block_on(async { req.send().await })
+            let output = self
+                .rt
+                .block_on(async { req.send().await })
                 .context("S3 LIST failed")?;
 
             for obj in output.contents() {
@@ -471,12 +495,7 @@ impl S3LockStore {
                 let client = self.client.clone();
                 let bucket = self.bucket.clone();
                 set.spawn(async move {
-                    let get_result = client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send()
-                        .await;
+                    let get_result = client.get_object().bucket(&bucket).key(&key).send().await;
                     if let Ok(get_output) = get_result {
                         if let Ok(body) = get_output.body.collect().await.map(|b| b.to_vec()) {
                             return serde_json::from_slice::<LockEntry>(&body).ok();
@@ -499,7 +518,14 @@ impl S3LockStore {
 }
 
 impl LockStore for S3LockStore {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult> {
+    fn try_lock(
+        &self,
+        symbol_id: &str,
+        agent_id: &str,
+        intent: &str,
+        ttl_seconds: u64,
+        mode: &str,
+    ) -> Result<LockResult> {
         let entry = LockEntry {
             symbol_id: symbol_id.to_string(),
             agent_id: agent_id.to_string(),
@@ -545,12 +571,16 @@ impl LockStore for S3LockStore {
     fn all_locks(&self) -> Result<Vec<LockEntry>> {
         let all = self.list_all_locks()?;
         // Filter out expired
-        Ok(all.into_iter().filter(|e| !Self::is_entry_expired(e)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|e| !Self::is_entry_expired(e))
+            .collect())
     }
 
     fn locks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
         let all = self.list_all_locks()?;
-        Ok(all.into_iter()
+        Ok(all
+            .into_iter()
             .filter(|e| e.agent_id == agent_id && !Self::is_entry_expired(e))
             .map(|e| (e.symbol_id, e.intent))
             .collect())

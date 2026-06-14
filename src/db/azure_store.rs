@@ -47,17 +47,18 @@ impl AzureLockStore {
     pub fn from_config(config: &AzureConfig) -> Result<Self> {
         let rt = tokio::runtime::Runtime::new()?;
 
-        let storage_credentials = StorageCredentials::access_key(
-            &config.account,
-            config.access_key.clone(),
-        );
+        let storage_credentials =
+            StorageCredentials::access_key(&config.account, config.access_key.clone());
         let service_client = BlobServiceClient::new(&config.account, storage_credentials);
         let container_client = service_client.container_client(&config.container);
 
         let handle = rt.handle().clone();
         Ok(Self {
             client: container_client,
-            prefix: config.prefix.clone().unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
+            prefix: config
+                .prefix
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
             _runtime: rt,
             rt: handle,
         })
@@ -92,9 +93,13 @@ impl AzureLockStore {
     fn put_at(&self, key: &str, entry: &LockEntry) -> Result<()> {
         let body = serde_json::to_vec(entry)?;
         let blob = self.client.blob_client(key);
-        self.rt.block_on(async {
-            blob.put_block_blob(body).content_type("application/json").await
-        }).context("Azure PUT failed")?;
+        self.rt
+            .block_on(async {
+                blob.put_block_blob(body)
+                    .content_type("application/json")
+                    .await
+            })
+            .context("Azure PUT failed")?;
         Ok(())
     }
 
@@ -120,7 +125,9 @@ impl AzureLockStore {
         let blob = self.client.blob_client(key);
         let result = self.rt.block_on(async { blob.get_content().await });
         match result {
-            Ok(data) => Ok(Some(serde_json::from_slice(&data).context("Failed to parse lock entry")?)),
+            Ok(data) => Ok(Some(
+                serde_json::from_slice(&data).context("Failed to parse lock entry")?,
+            )),
             Err(e) => {
                 let s = e.to_string();
                 if s.contains("BlobNotFound") || s.contains("404") || s.contains("not found") {
@@ -184,7 +191,10 @@ impl AzureLockStore {
                 let readers = self.other_active_readers(&entry.symbol_id, &entry.agent_id)?;
                 if let Some(r) = readers.into_iter().next() {
                     self.delete_lock(&entry.symbol_id)?;
-                    Ok(LockResult::Blocked { by_agent: r.agent_id, by_intent: r.intent })
+                    Ok(LockResult::Blocked {
+                        by_agent: r.agent_id,
+                        by_intent: r.intent,
+                    })
                 } else {
                     Ok(LockResult::Granted)
                 }
@@ -206,7 +216,10 @@ impl AzureLockStore {
             if Self::is_entry_expired(&w) {
                 self.delete_lock(symbol_id)?;
             } else {
-                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
             }
         }
 
@@ -215,7 +228,10 @@ impl AzureLockStore {
         if let Some(w) = self.get_lock(symbol_id)? {
             if w.agent_id != *agent_id && !Self::is_entry_expired(&w) {
                 let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
-                return Ok(LockResult::Blocked { by_agent: w.agent_id, by_intent: w.intent });
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
             }
         }
 
@@ -226,19 +242,20 @@ impl AzureLockStore {
         let key = self.lock_key(symbol_id);
         let blob = self.client.blob_client(&key);
 
-        let result = self.rt.block_on(async {
-            blob.get_content().await
-        });
+        let result = self.rt.block_on(async { blob.get_content().await });
 
         match result {
             Ok(data) => {
-                let entry: LockEntry = serde_json::from_slice(&data)
-                    .context("Failed to parse lock entry")?;
+                let entry: LockEntry =
+                    serde_json::from_slice(&data).context("Failed to parse lock entry")?;
                 Ok(Some(entry))
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("BlobNotFound") || err_str.contains("404") || err_str.contains("not found") {
+                if err_str.contains("BlobNotFound")
+                    || err_str.contains("404")
+                    || err_str.contains("not found")
+                {
                     Ok(None)
                 } else {
                     Err(anyhow::anyhow!("Azure GET failed: {}", e))
@@ -252,11 +269,13 @@ impl AzureLockStore {
         let body = serde_json::to_vec(entry)?;
         let blob = self.client.blob_client(&key);
 
-        self.rt.block_on(async {
-            blob.put_block_blob(body)
-                .content_type("application/json")
-                .await
-        }).context("Azure PUT failed")?;
+        self.rt
+            .block_on(async {
+                blob.put_block_blob(body)
+                    .content_type("application/json")
+                    .await
+            })
+            .context("Azure PUT failed")?;
 
         Ok(())
     }
@@ -280,7 +299,8 @@ impl AzureLockStore {
             Err(e) => {
                 let err_str = e.to_string();
                 // 409 Conflict or 412 Precondition Failed = blob already exists
-                if err_str.contains("409") || err_str.contains("412")
+                if err_str.contains("409")
+                    || err_str.contains("412")
                     || err_str.contains("BlobAlreadyExists")
                     || err_str.contains("ConditionNotMet")
                 {
@@ -296,9 +316,7 @@ impl AzureLockStore {
         let key = self.lock_key(symbol_id);
         let blob = self.client.blob_client(&key);
 
-        let result = self.rt.block_on(async {
-            blob.delete().await
-        });
+        let result = self.rt.block_on(async { blob.delete().await });
 
         match result {
             Ok(_) => Ok(()),
@@ -330,7 +348,11 @@ impl AzureLockStore {
     fn list_under_prefix(&self, prefix: &str) -> Result<Vec<LockEntry>> {
         let result = self.rt.block_on(async {
             let mut entries = Vec::new();
-            let mut stream = self.client.list_blobs().prefix(prefix.to_string()).into_stream();
+            let mut stream = self
+                .client
+                .list_blobs()
+                .prefix(prefix.to_string())
+                .into_stream();
 
             use futures::StreamExt;
             while let Some(page) = stream.next().await {
@@ -359,7 +381,14 @@ impl AzureLockStore {
 }
 
 impl LockStore for AzureLockStore {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult> {
+    fn try_lock(
+        &self,
+        symbol_id: &str,
+        agent_id: &str,
+        intent: &str,
+        ttl_seconds: u64,
+        mode: &str,
+    ) -> Result<LockResult> {
         let entry = LockEntry {
             symbol_id: symbol_id.to_string(),
             agent_id: agent_id.to_string(),
@@ -402,12 +431,16 @@ impl LockStore for AzureLockStore {
 
     fn all_locks(&self) -> Result<Vec<LockEntry>> {
         let all = self.list_all_locks()?;
-        Ok(all.into_iter().filter(|e| !Self::is_entry_expired(e)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|e| !Self::is_entry_expired(e))
+            .collect())
     }
 
     fn locks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
         let all = self.list_all_locks()?;
-        Ok(all.into_iter()
+        Ok(all
+            .into_iter()
             .filter(|e| e.agent_id == agent_id && !Self::is_entry_expired(e))
             .map(|e| (e.symbol_id, e.intent))
             .collect())

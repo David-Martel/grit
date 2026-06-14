@@ -1,19 +1,21 @@
-pub mod lock_store;
-pub mod sqlite_store;
-pub mod s3_store;
 pub mod azure_store;
+pub mod lock_store;
+pub mod s3_store;
+pub mod sqlite_store;
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-use crate::parser::{Symbol, Dep};
+use crate::parser::{Dep, Symbol};
 
 /// Apply standard PRAGMA settings to a new SQLite connection.
 pub fn configure_connection(conn: &Connection) -> Result<()> {
     // foreign_keys is enforced at runtime (the bundled SQLite defaults it on),
     // but set it explicitly so the locks/deps -> symbols references stay
     // enforced regardless of how SQLite was built.
-    match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;") {
+    match conn
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
+    {
         Ok(_) => Ok(()),
         Err(e) => {
             let err_str = e.to_string();
@@ -30,6 +32,9 @@ pub fn configure_connection(conn: &Connection) -> Result<()> {
 
 /// (id, file, name, kind, locked_by_agent)
 pub type SymbolRow = (String, String, String, String, Option<String>);
+
+/// (symbol_id, agent_id, intent, mode, queued_at)
+pub type QueueRow = (String, String, String, String, String);
 
 pub struct Database {
     conn: Connection,
@@ -122,7 +127,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
             CREATE INDEX IF NOT EXISTS idx_deps_callee ON deps(callee);
             CREATE INDEX IF NOT EXISTS idx_queue_symbol ON lock_queue(symbol_id);
-            "
+            ",
         )?;
 
         // Migrate pre-ttl databases: add ttl_seconds only when it is actually
@@ -137,9 +142,8 @@ impl Database {
             cols.iter().any(|c| c == "ttl_seconds")
         };
         if !has_ttl {
-            self.conn.execute_batch(
-                "ALTER TABLE locks ADD COLUMN ttl_seconds INTEGER DEFAULT 600;"
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE locks ADD COLUMN ttl_seconds INTEGER DEFAULT 600;")?;
         }
 
         Ok(())
@@ -154,10 +158,18 @@ impl Database {
                  ON CONFLICT(id) DO UPDATE SET
                     start_line = excluded.start_line,
                     end_line = excluded.end_line,
-                    hash = excluded.hash"
+                    hash = excluded.hash",
             )?;
             for s in symbols {
-                stmt.execute(params![s.id, s.file, s.name, s.kind, s.start_line, s.end_line, s.hash])?;
+                stmt.execute(params![
+                    s.id,
+                    s.file,
+                    s.name,
+                    s.kind,
+                    s.start_line,
+                    s.end_line,
+                    s.hash
+                ])?;
             }
         }
         tx.commit()?;
@@ -168,7 +180,11 @@ impl Database {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: Vec<String> = files.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = files
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
         // Join only NON-expired locks, so a symbol whose only lock has expired
         // is still reported available (an expired lock no longer occupies it).
         let sql = format!(
@@ -180,25 +196,34 @@ impl Database {
             placeholders.join(", ")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = files.iter().map(|f| f as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = files
+            .iter()
+            .map(|f| f as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn count_symbols(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
         Ok(count as usize)
     }
 
     pub fn list_symbols(&self, file_filter: Option<&str>) -> Result<Vec<SymbolRow>> {
         let sql = match file_filter {
-            Some(_) => "SELECT s.id, s.file, s.name, s.kind, l.agent_id
+            Some(_) => {
+                "SELECT s.id, s.file, s.name, s.kind, l.agent_id
                         FROM symbols s LEFT JOIN locks l ON s.id = l.symbol_id
                         WHERE s.file LIKE ?1
-                        ORDER BY s.file, s.start_line",
-            None =>    "SELECT s.id, s.file, s.name, s.kind, l.agent_id
+                        ORDER BY s.file, s.start_line"
+            }
+            None => {
+                "SELECT s.id, s.file, s.name, s.kind, l.agent_id
                         FROM symbols s LEFT JOIN locks l ON s.id = l.symbol_id
-                        ORDER BY s.file, s.start_line",
+                        ORDER BY s.file, s.start_line"
+            }
         };
         let mut stmt = self.conn.prepare(sql)?;
         let mut results: Vec<SymbolRow> = Vec::new();
@@ -207,13 +232,25 @@ impl Database {
                 let pattern = format!("%{}%", f);
                 let mut rows = stmt.query(params![pattern])?;
                 while let Some(row) = rows.next()? {
-                    results.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?));
+                    results.push((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ));
                 }
             }
             None => {
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
-                    results.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?));
+                    results.push((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ));
                 }
             }
         };
@@ -221,9 +258,16 @@ impl Database {
     }
 
     pub fn search_symbols(&self, keywords: &[&str]) -> Result<Vec<SymbolRow>> {
-        let conditions: Vec<String> = keywords.iter().enumerate().map(|(i, _)| {
-            format!("(s.name LIKE ?{0} OR s.file LIKE ?{0} OR s.id LIKE ?{0})", i + 1)
-        }).collect();
+        let conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "(s.name LIKE ?{0} OR s.file LIKE ?{0} OR s.id LIKE ?{0})",
+                    i + 1
+                )
+            })
+            .collect();
         let where_clause = if conditions.is_empty() {
             "1=1".to_string()
         } else {
@@ -238,11 +282,20 @@ impl Database {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         let mut rows = stmt.query(param_refs.as_slice())?;
         let mut results: Vec<SymbolRow> = Vec::new();
         while let Some(row) = rows.next()? {
-            results.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?));
+            results.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ));
         }
         Ok(results)
     }
@@ -287,7 +340,7 @@ impl Database {
             // Clear old deps first
             tx.execute("DELETE FROM deps", [])?;
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO deps (caller, callee, kind) VALUES (?1, ?2, ?3)"
+                "INSERT OR REPLACE INTO deps (caller, callee, kind) VALUES (?1, ?2, ?3)",
             )?;
             for d in deps {
                 stmt.execute(params![d.caller, d.callee, d.kind])?;
@@ -300,12 +353,10 @@ impl Database {
     /// Get direct callees of a symbol
     #[allow(dead_code)]
     pub fn get_deps(&self, symbol_id: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT callee, kind FROM deps WHERE caller = ?1"
-        )?;
-        let rows = stmt.query_map(params![symbol_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT callee, kind FROM deps WHERE caller = ?1")?;
+        let rows = stmt.query_map(params![symbol_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -317,7 +368,7 @@ impl Database {
                  UNION
                  SELECT d.callee FROM deps d JOIN dep_tree t ON d.caller = t.sym
              )
-             SELECT DISTINCT sym FROM dep_tree"
+             SELECT DISTINCT sym FROM dep_tree",
         )?;
         let rows = stmt.query_map(params![symbol_id], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -325,7 +376,9 @@ impl Database {
 
     #[allow(dead_code)]
     pub fn count_deps(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM deps", [], |r| r.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM deps", [], |r| r.get(0))?;
         Ok(count as usize)
     }
 
@@ -381,23 +434,29 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT agent_id FROM lock_queue WHERE symbol_id = ?1 ORDER BY queued_at ASC, rowid ASC"
         )?;
-        let agents: Vec<String> = stmt.query_map(params![symbol_id], |row| row.get(0))?
+        let agents: Vec<String> = stmt
+            .query_map(params![symbol_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(agents.iter().position(|a| a == agent_id).map(|p| p + 1))
     }
 
     /// List all queued entries
-    pub fn list_queue(&self) -> Result<Vec<(String, String, String, String, String)>> {
+    pub fn list_queue(&self) -> Result<Vec<QueueRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol_id, agent_id, intent, COALESCE(mode, 'write'), queued_at
-             FROM lock_queue ORDER BY symbol_id, queued_at ASC, rowid ASC"
+             FROM lock_queue ORDER BY symbol_id, queued_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-
 }
 
 #[cfg(test)]
@@ -438,7 +497,14 @@ mod tests {
     fn test_upsert_and_count_symbols() {
         let (_tmp, db) = setup_db();
         let symbols: Vec<Symbol> = (0..5)
-            .map(|i| make_symbol(&format!("file.rs::fn{}", i), "file.rs", &format!("fn{}", i), "function"))
+            .map(|i| {
+                make_symbol(
+                    &format!("file.rs::fn{}", i),
+                    "file.rs",
+                    &format!("fn{}", i),
+                    "function",
+                )
+            })
             .collect();
         db.upsert_symbols(&symbols).unwrap();
         assert_eq!(db.count_symbols().unwrap(), 5);
@@ -519,10 +585,12 @@ mod tests {
         db.upsert_symbols(&symbols).unwrap();
 
         // Lock symbol "f.rs::b"
-        db.conn.execute(
-            "INSERT INTO locks (symbol_id, agent_id, intent) VALUES (?1, ?2, ?3)",
-            params!["f.rs::b", "agent-1", "editing"],
-        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO locks (symbol_id, agent_id, intent) VALUES (?1, ?2, ?3)",
+                params!["f.rs::b", "agent-1", "editing"],
+            )
+            .unwrap();
 
         let available = db.available_symbols_in_files(&["f.rs"]).unwrap();
         assert_eq!(available.len(), 2);
@@ -574,8 +642,10 @@ mod tests {
     #[test]
     fn test_queue_enqueue_and_list() {
         let (_tmp, db) = setup_db();
-        db.enqueue("sym::a", "agent-1", "want to edit", "write").unwrap();
-        db.enqueue("sym::a", "agent-2", "also want to edit", "write").unwrap();
+        db.enqueue("sym::a", "agent-1", "want to edit", "write")
+            .unwrap();
+        db.enqueue("sym::a", "agent-2", "also want to edit", "write")
+            .unwrap();
 
         let queue = db.list_queue().unwrap();
         assert_eq!(queue.len(), 2);
@@ -649,8 +719,16 @@ mod tests {
         db.upsert_symbols(&symbols).unwrap();
 
         let deps = vec![
-            Dep { caller: "a.rs::login".into(), callee: "a.rs::validate".into(), kind: "calls".into() },
-            Dep { caller: "a.rs::login".into(), callee: "a.rs::hash".into(), kind: "calls".into() },
+            Dep {
+                caller: "a.rs::login".into(),
+                callee: "a.rs::validate".into(),
+                kind: "calls".into(),
+            },
+            Dep {
+                caller: "a.rs::login".into(),
+                callee: "a.rs::hash".into(),
+                kind: "calls".into(),
+            },
         ];
         db.upsert_deps(&deps).unwrap();
 
@@ -670,8 +748,16 @@ mod tests {
 
         // a -> b -> c
         let deps = vec![
-            Dep { caller: "a.rs::a".into(), callee: "a.rs::b".into(), kind: "calls".into() },
-            Dep { caller: "a.rs::b".into(), callee: "a.rs::c".into(), kind: "calls".into() },
+            Dep {
+                caller: "a.rs::a".into(),
+                callee: "a.rs::b".into(),
+                kind: "calls".into(),
+            },
+            Dep {
+                caller: "a.rs::b".into(),
+                callee: "a.rs::c".into(),
+                kind: "calls".into(),
+            },
         ];
         db.upsert_deps(&deps).unwrap();
 
@@ -684,7 +770,8 @@ mod tests {
     #[test]
     fn test_enqueue_preserves_position_on_requeue() {
         let (_tmp, db) = setup_db();
-        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")]).unwrap();
+        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")])
+            .unwrap();
 
         db.enqueue("f.rs::x", "agent-1", "first", "write").unwrap();
         db.enqueue("f.rs::x", "agent-2", "second", "write").unwrap();
@@ -692,7 +779,8 @@ mod tests {
         assert_eq!(db.queue_position("f.rs::x", "agent-2").unwrap(), Some(2));
 
         // Re-enqueuing agent-1 (e.g. retry) must NOT send it to the back.
-        db.enqueue("f.rs::x", "agent-1", "first-again", "write").unwrap();
+        db.enqueue("f.rs::x", "agent-1", "first-again", "write")
+            .unwrap();
         assert_eq!(db.queue_position("f.rs::x", "agent-1").unwrap(), Some(1));
         assert_eq!(db.queue_position("f.rs::x", "agent-2").unwrap(), Some(2));
 
@@ -705,18 +793,24 @@ mod tests {
     #[test]
     fn test_availability_ignores_expired_locks() {
         let (_tmp, db) = setup_db();
-        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")]).unwrap();
+        db.upsert_symbols(&[make_symbol("f.rs::x", "f.rs", "x", "function")])
+            .unwrap();
 
         // An expired lock (ttl 1s, locked_at well in the past) must not make the
         // symbol look unavailable.
-        db.conn.execute(
-            "INSERT INTO locks (symbol_id, agent_id, intent, mode, locked_at, ttl_seconds)
+        db.conn
+            .execute(
+                "INSERT INTO locks (symbol_id, agent_id, intent, mode, locked_at, ttl_seconds)
              VALUES ('f.rs::x', 'ghost', 'stale', 'write', datetime('now','-1 hour'), 1)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
         let avail = db.available_symbols_in_files(&["f.rs"]).unwrap();
-        assert!(avail.contains(&"f.rs::x".to_string()), "expired lock should free the symbol");
+        assert!(
+            avail.contains(&"f.rs::x".to_string()),
+            "expired lock should free the symbol"
+        );
 
         // A fresh lock keeps it unavailable.
         db.conn.execute(
@@ -724,6 +818,9 @@ mod tests {
             [],
         ).unwrap();
         let avail2 = db.available_symbols_in_files(&["f.rs"]).unwrap();
-        assert!(!avail2.contains(&"f.rs::x".to_string()), "fresh lock should occupy the symbol");
+        assert!(
+            !avail2.contains(&"f.rs::x".to_string()),
+            "fresh lock should occupy the symbol"
+        );
     }
 }

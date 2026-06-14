@@ -21,15 +21,19 @@ fn default_mode() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LockResult {
     Granted,
-    Blocked {
-        by_agent: String,
-        by_intent: String,
-    },
+    Blocked { by_agent: String, by_intent: String },
 }
 
 /// Abstract lock storage — implementations: SQLite (local), S3-compatible (cloud)
 pub trait LockStore: Send + Sync {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult>;
+    fn try_lock(
+        &self,
+        symbol_id: &str,
+        agent_id: &str,
+        intent: &str,
+        ttl_seconds: u64,
+        mode: &str,
+    ) -> Result<LockResult>;
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()>;
     fn release_all(&self, agent_id: &str) -> Result<usize>;
     fn all_locks(&self) -> Result<Vec<LockEntry>>;
