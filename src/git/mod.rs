@@ -7,6 +7,27 @@ pub struct GitRepo {
     root: PathBuf,
 }
 
+/// Convert a `PathBuf` to a string suitable for passing to git command-line tools.
+///
+/// On Windows, `std::fs::canonicalize` returns paths with a `\\?\` (extended-length)
+/// prefix (e.g. `\\?\C:\foo\bar`). Git does not accept this prefix on the command
+/// line and will fail with "could not create leading directories".  We strip the
+/// prefix so git receives a plain Win32 path.
+fn path_for_git(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    // Extended-length prefix — `\\?\` or `\\?\UNC\`
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", stripped);
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+    s.into_owned()
+}
+
 impl GitRepo {
     pub fn open(path: &str) -> Result<Self> {
         let root = std::fs::canonicalize(path)?;
@@ -44,31 +65,19 @@ impl GitRepo {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
+        let wt_path_str = path_for_git(&wt_path);
         let output = if branch_exists {
             eprintln!(
                 "  warn: branch {} already exists from a previous run; reusing it for agent {}",
                 branch_name, agent_id
             );
             Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    "--",
-                    &wt_path.to_string_lossy(),
-                    &branch_name,
-                ])
+                .args(["worktree", "add", "--", &wt_path_str, &branch_name])
                 .current_dir(&self.root)
                 .output()
         } else {
             Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch_name,
-                    "--",
-                    &wt_path.to_string_lossy(),
-                ])
+                .args(["worktree", "add", "-b", &branch_name, "--", &wt_path_str])
                 .current_dir(&self.root)
                 .output()
         }
@@ -97,14 +106,9 @@ impl GitRepo {
             anyhow::bail!("Worktree does not exist at {}", wt_path.display());
         }
 
+        let wt_path_str = path_for_git(&wt_path);
         let output = Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                "--",
-                &wt_path.to_string_lossy(),
-            ])
+            .args(["worktree", "remove", "--force", "--", &wt_path_str])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree remove")?;
@@ -306,13 +310,10 @@ impl GitRepo {
                     let mut liveness_known = false;
                     if let Ok(contents) = fs::read_to_string(path) {
                         if let Ok(pid) = contents.trim().parse::<u32>() {
-                            // Check if process is alive (kill with signal 0)
-                            use std::process::Command as Cmd;
-                            if let Ok(output) =
-                                Cmd::new("kill").args(["-0", &pid.to_string()]).output()
-                            {
+                            // Check whether the lock-holding process is still alive.
+                            if let Some(alive) = is_process_alive(pid) {
                                 liveness_known = true;
-                                if !output.status.success() {
+                                if !alive {
                                     // Process is dead -- lock is stale.
                                     is_stale = true;
                                 }
@@ -491,6 +492,55 @@ impl GitRepo {
         agents.sort();
         Ok(agents)
     }
+}
+
+/// Check whether a process identified by `pid` is currently alive.
+///
+/// Returns `Some(true)` if the process is running, `Some(false)` if it is
+/// definitely dead, or `None` when the check cannot be performed (e.g. the
+/// required OS API is unavailable or access is denied).
+///
+/// # Unix
+/// Sends signal 0 to the process via the `kill` command.  This is a
+/// zero-overhead probe — no signal is actually delivered.
+///
+/// # Windows
+/// Opens the process with `PROCESS_QUERY_LIMITED_INFORMATION` and inspects its
+/// exit code.  A process that is still running has exit code
+/// `STILL_ACTIVE` (259).  We avoid `unsafe` by shelling out to
+/// `tasklist /FI "PID eq <pid>" /NH`, which is available on every supported
+/// Windows version and does not require elevated privileges.
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> Option<bool> {
+    use std::process::Command as Cmd;
+    let output = Cmd::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .ok()?;
+    Some(output.status.success())
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> Option<bool> {
+    // `tasklist /FI "PID eq <n>" /NH` prints one line per matching process.
+    // If the process is gone the output contains "INFO: No tasks are running
+    // which match the specified criteria." — no matching image line.
+    use std::process::Command as Cmd;
+    let output = Cmd::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A live process produces a line with the PID in it.
+    // Check for the PID string surrounded by expected delimiters to avoid
+    // false-positive substring matches.
+    let alive = stdout.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .map(|w| w == pid.to_string())
+            .unwrap_or(false)
+    });
+    Some(alive)
 }
 
 /// RAII file lock — automatically removed when dropped

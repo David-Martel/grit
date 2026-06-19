@@ -993,6 +993,18 @@ fn cmd_watch(repo: &str, poll: Option<u64>) -> Result<()> {
         return cmd_watch_poll(repo, poll.unwrap_or(5));
     }
 
+    cmd_watch_socket(&dir)
+}
+
+/// Connect to the room notification server and stream events.
+///
+/// On Unix this connects to the Unix-domain socket `room.sock`.
+/// On Windows this connects to the TCP loopback port recorded in `room.port`.
+#[cfg(unix)]
+fn cmd_watch_socket(dir: &std::path::Path) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+
     let sock_path = dir.join("room.sock");
 
     if !sock_path.exists() {
@@ -1003,9 +1015,6 @@ fn cmd_watch(repo: &str, poll: Option<u64>) -> Result<()> {
             sock_path.display()
         );
     }
-
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
 
     println!("Connecting to room socket at {}...", sock_path.display());
     let stream = match UnixStream::connect(&sock_path) {
@@ -1023,8 +1032,55 @@ fn cmd_watch(repo: &str, poll: Option<u64>) -> Result<()> {
             return Err(e.into());
         }
     };
-    let reader = BufReader::new(stream);
 
+    watch_stream(BufReader::new(stream))
+}
+
+/// Windows variant: connect to the TCP loopback port stored in `room.port`.
+#[cfg(windows)]
+fn cmd_watch_socket(dir: &std::path::Path) -> Result<()> {
+    use std::io::BufReader;
+    use std::net::TcpStream;
+
+    let port_path = dir.join("room.port");
+
+    if !port_path.exists() {
+        anyhow::bail!(
+            "No room port file found at {}.\n\
+             The notification server only runs during `grit init`.\n\
+             Re-run `grit init` in a long-lived process, or use `grit status` to poll.",
+            port_path.display()
+        );
+    }
+
+    let port_str = std::fs::read_to_string(&port_path)?;
+    let port: u16 = port_str
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid port number in {}", port_path.display()))?;
+    let addr = format!("127.0.0.1:{port}");
+
+    println!("Connecting to room server at {}...", addr);
+    let stream = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                let _ = std::fs::remove_file(&port_path);
+                anyhow::bail!(
+                    "Room server is not running (connection refused to {}). Removed stale port file.\n\
+                     Re-run `grit init` to start the notification server.",
+                    addr
+                );
+            }
+            return Err(e.into());
+        }
+    };
+
+    watch_stream(BufReader::new(stream))
+}
+
+/// Shared event-printing loop — reads newline-delimited JSON from any `BufRead`.
+fn watch_stream<R: std::io::BufRead>(reader: R) -> Result<()> {
     println!("Watching for events (Ctrl+C to stop):\n");
 
     for line in reader.lines() {
